@@ -1,5 +1,6 @@
 import Foundation
 import ImageCaptureCore
+import IOKit
 import PTPKit
 
 /// PTP over ImageCaptureCore's pass-through (`requestSendPTPCommand`). We never claim the
@@ -8,12 +9,17 @@ import PTPKit
 /// All ImageCaptureCore delegate callbacks arrive on the main thread; this type is main-actor
 /// isolated to match.
 @MainActor
-public final class ICCTransport: NSObject, PTPTransport {
+public final class ICCTransport: NSObject, CameraTransport {
     public typealias Logger = @MainActor (String) -> Void
 
     private let browser = ICDeviceBrowser()
     private var cameras: [ICCameraDevice] = []
     private var device: ICCameraDevice?
+    /// Camera chosen by `findCamera`, opened by `openSession(timeout:)`.
+    private var candidate: ICCameraDevice?
+    /// Closes we asked for whose `didCloseSession` callback hasn't arrived yet. A late callback
+    /// from our own close must not tear down a session reopened in the meantime.
+    private var expectedCloses = 0
     private var openContinuation: CheckedContinuation<Void, Error>?
     private var cameraWaiters: [CheckedContinuation<ICCameraDevice?, Never>] = []
     private var transactionID: UInt32 = 1
@@ -26,6 +32,10 @@ public final class ICCTransport: NSObject, PTPTransport {
     public var onDisconnect: (@MainActor () -> Void)?
 
     public var deviceName: String? { device?.name }
+
+    /// Fault injection for soak tests: the next transaction's completion is dropped, as if
+    /// ImageCaptureCore never called back, so it can only end by timing out.
+    public var dropNextCompletion = false
 
     public override init() {
         super.init()
@@ -54,6 +64,34 @@ public final class ICCTransport: NSObject, PTPTransport {
         return cam
     }
 
+    public func findCamera(timeout: Duration) async throws -> String {
+        let cam = try await waitForCamera(timeout: timeout)
+        candidate = cam
+        return cam.name ?? "camera"
+    }
+
+    public func openSession(timeout: Duration) async throws {
+        guard let candidate else { throw PTPError.noCameraFound }
+        try await openSession(candidate, timeout: timeout)
+    }
+
+    /// Looks for an attached USB interface of class 6 (Still Image / PTP) in the IORegistry.
+    /// Cheap, and independent of whether ImageCaptureCore will deliver the device to us.
+    public func attachedUSBCameraName() -> String? {
+        guard let match = IOServiceMatching("IOUSBHostInterface") as NSMutableDictionary? else { return nil }
+        match["bInterfaceClass"] = 6
+        var iterator: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, match, &iterator) == KERN_SUCCESS else { return nil }
+        defer { IOObjectRelease(iterator) }
+        let service = IOIteratorNext(iterator)
+        guard service != 0 else { return nil }
+        defer { IOObjectRelease(service) }
+        let name = IORegistryEntrySearchCFProperty(
+            service, kIOServicePlane, "USB Product Name" as CFString, kCFAllocatorDefault,
+            IOOptionBits(kIORegistryIterateRecursively | kIORegistryIterateParents))
+        return (name as? String) ?? "USB still-image device"
+    }
+
     nonisolated private static func acceptsPTP(_ d: ICCameraDevice) -> Bool {
         d.capabilities.contains(ICDeviceCapability.cameraDeviceCanAcceptPTPCommands.rawValue)
     }
@@ -62,6 +100,8 @@ public final class ICCTransport: NSObject, PTPTransport {
 
     public func openSession(_ camera: ICCameraDevice, timeout: Duration = .seconds(10)) async throws {
         if isSessionOpen { closeSession() }
+        // A previous open that timed out may still be pending; fail it rather than leak it.
+        resumeOpen(.failure(PTPError.timeout("the camera session to open (superseded)")))
         camera.delegate = self
         device = camera
         transactionID = 1
@@ -81,7 +121,10 @@ public final class ICCTransport: NSObject, PTPTransport {
 
     public func closeSession() {
         isSessionOpen = false
-        device?.requestCloseSession()
+        if let device {
+            expectedCloses += 1
+            device.requestCloseSession()
+        }
         device = nil
     }
 
@@ -115,9 +158,13 @@ public final class ICCTransport: NSObject, PTPTransport {
         }
         defer { timer.cancel() }
 
+        let drop = dropNextCompletion
+        dropNextCompletion = false
+        if drop { log("fault injection: dropping the completion of \(label)") }
         let (first, second) = try await withCheckedThrowingContinuation { c in
             once.set(c)
             device.requestSendPTPCommand(command, outData: outData) { a, b, error in
+                if drop { return }
                 if let error { once.resume(throwing: error) } else { once.resume(returning: (a, b)) }
             }
         }
@@ -206,6 +253,7 @@ extension ICCTransport: ICDeviceBrowserDelegate {
     }
 
     private func handleRemoval(of d: ICDevice) {
+        if d === candidate { candidate = nil }
         guard d === device else { return }
         device = nil
         isSessionOpen = false
@@ -223,8 +271,19 @@ extension ICCTransport: ICCameraDeviceDelegate {
         }
     }
 
-    nonisolated public func device(_ device: ICDevice, didCloseSessionWithError error: Error?) {
-        onMain { [self] in isSessionOpen = false }
+    nonisolated public func device(_ closed: ICDevice, didCloseSessionWithError error: Error?) {
+        onMain { [self] in
+            if expectedCloses > 0 {
+                expectedCloses -= 1
+                return
+            }
+            // The camera (or ptpcamerad) closed the session under us: treat as a disconnect.
+            guard closed === device, isSessionOpen else { return }
+            log("session closed by the device\(error.map { ": \($0)" } ?? "")")
+            isSessionOpen = false
+            device = nil
+            onDisconnect?()
+        }
     }
 
     nonisolated public func didRemove(_ device: ICDevice) {

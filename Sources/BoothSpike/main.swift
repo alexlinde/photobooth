@@ -5,12 +5,17 @@ import SonyCamera
 
 // Phase 0 spike: prove the ImageCaptureCore → Sony PTP path end to end.
 //   booth-spike [--frames N] [--no-capture] [--out DIR] [--quiet-liveview]
+// Phase 1 soak: run SonyBoothCamera for a while, capturing every 20 s.
+//   booth-spike --soak SECONDS [--soak-fault] [--trace]
 
 struct Options {
     var frames = 30
     var capture = true
     var out = URL(fileURLWithPath: "spike-output")
     var quietLiveView = false
+    var soak: Int?
+    var soakFault = false
+    var trace = false
 
     init(_ args: [String]) {
         var it = args.dropFirst().makeIterator()
@@ -20,6 +25,9 @@ struct Options {
             case "--no-capture": capture = false
             case "--out": out = URL(fileURLWithPath: it.next() ?? out.path)
             case "--quiet-liveview": quietLiveView = true
+            case "--soak": soak = Int(it.next() ?? "") ?? 120
+            case "--soak-fault": soakFault = true
+            case "--trace": trace = true
             default: print("unknown argument \(a)"); exit(2)
             }
         }
@@ -42,6 +50,9 @@ func fail(_ what: String, _ error: Error) -> Never {
 @MainActor
 func run() async {
     let opts = Options(CommandLine.arguments)
+    if let seconds = opts.soak {
+        await soak(seconds: seconds, opts: opts)
+    }
     let fixtures = opts.out.appendingPathComponent("fixtures")
     let frames = opts.out.appendingPathComponent("liveview")
     try? FileManager.default.createDirectory(at: fixtures, withIntermediateDirectories: true)
@@ -207,6 +218,120 @@ struct DeviceInfo {
             version = try r.string()
         } catch { return nil }
     }
+}
+
+// MARK: - Soak
+
+func seconds(_ d: Duration) -> Double {
+    Double(d.components.seconds) + Double(d.components.attoseconds) / 1e18
+}
+
+/// Runs SonyBoothCamera for `seconds`: prints state changes and live-view fps every 5 s, does a
+/// prepare → 3 s → capture cycle every 20 s, and (with --soak-fault) injects a closed session at
+/// ~1/3 and a hung transaction at ~2/3 of the run, reporting how long recovery took.
+@MainActor
+func soak(seconds total: Int, opts: Options) async {
+    let dir = opts.out.appendingPathComponent("soak")
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    step("SOAK \(total)s\(opts.soakFault ? " with fault injection" : "")")
+
+    var o = SonyBoothCamera.Options()
+    o.log = { say("  \($0)") }
+    o.traceTransactions = opts.trace
+    let camera = SonyBoothCamera(options: o)
+
+    var frames = 0
+    var readyAt: [ContinuousClock.Instant] = []
+    let stateTask = Task { @MainActor in
+        for await s in camera.stateUpdates() {
+            say("STATE \(s)")
+            if s.isReady { readyAt.append(.now) }
+        }
+    }
+    let frameTask = Task { @MainActor in
+        for await _ in camera.liveViewFrames() { frames += 1 }
+    }
+    camera.start()
+
+    let t0 = ContinuousClock.now
+    let end = t0 + .seconds(total)
+    var faults: [(SonyBoothCamera.SimulatedFault, ContinuousClock.Instant)] = opts.soakFault
+        ? [(.sessionClosed, t0 + .seconds(total / 3 + 5)), (.transactionHang, t0 + .seconds(2 * total / 3 + 5))]
+        : []
+    var faultLog: [(SonyBoothCamera.SimulatedFault, ContinuousClock.Instant)] = []
+    var nextReport = t0 + .seconds(5)
+    var lastFrames = 0, lastFetched = 0, lastNotReady = 0
+    var nextCapture = t0 + .seconds(20)
+    var captureTask: Task<Void, Never>?
+    var captures = 0, failures = 0
+    var timings: [SonySession.CaptureTiming] = []
+    var countdownFps: [Double] = []
+    let fmt = DateFormatter()
+    fmt.dateFormat = "yyyyMMdd-HHmmss"
+
+    while ContinuousClock.now < end {
+        try? await Task.sleep(for: .milliseconds(100))
+        let now = ContinuousClock.now
+
+        if now >= nextReport {
+            let f = frames - lastFrames, fetched = camera.liveViewFramesFetched - lastFetched
+            let nr = camera.liveViewNotReady - lastNotReady
+            say(String(format: "[t=%3.0fs] %@ — live view %.1f fps delivered (%.1f fetched, %d not-ready)",
+                       seconds(now - t0), "\(camera.state)", Double(f) / 5, Double(fetched) / 5, nr))
+            lastFrames = frames; lastFetched = camera.liveViewFramesFetched; lastNotReady = camera.liveViewNotReady
+            nextReport += .seconds(5)
+        }
+
+        if let (fault, at) = faults.first, now >= at, captureTask == nil, camera.state.isReady {
+            faults.removeFirst()
+            faultLog.append((fault, now))
+            camera.simulateFault(fault)
+        }
+
+        if now >= nextCapture, captureTask == nil, camera.state.isReady, now + .seconds(6) < end {
+            nextCapture = now + .seconds(20)
+            captureTask = Task { @MainActor in
+                defer { captureTask = nil }
+                say("CAPTURE: prepare (half-press), 3 s countdown")
+                let f0 = frames
+                await camera.prepareCapture()
+                try? await Task.sleep(for: .seconds(3))
+                countdownFps.append(Double(frames - f0) / 3)
+                say(String(format: "CAPTURE: %.1f fps during countdown (live view while half-pressed)", Double(frames - f0) / 3))
+                do {
+                    let photo = try await camera.capture()
+                    captures += 1
+                    let url = dir.appendingPathComponent("\(fmt.string(from: photo.capturedAt))-\(photo.cameraFilename ?? "photo.jpg")")
+                    try? photo.jpeg.write(to: url)
+                    if let t = camera.lastCaptureTiming { timings.append(t) }
+                    say("CAPTURE ✓ #\(captures) \(photo.cameraFilename ?? "?") \(photo.jpeg.count / 1024) KB → \(url.lastPathComponent)")
+                } catch {
+                    failures += 1
+                    say("CAPTURE ✗ \(error)")
+                }
+            }
+        }
+    }
+    await captureTask?.value
+
+    step("SOAK SUMMARY")
+    say("captures: \(captures) ok, \(failures) failed; connections: \(camera.connectCount)")
+    say(String(format: "live view: %d frames delivered over %ds = %.1f fps average; countdown fps %@",
+               frames, total, Double(frames) / Double(total),
+               countdownFps.map { String(format: "%.1f", $0) }.joined(separator: ", ")))
+    for (i, t) in timings.enumerated() { say("  capture \(i + 1): \(t)") }
+    for (fault, at) in faultLog {
+        if let back = readyAt.first(where: { $0 > at }) {
+            say(String(format: "fault %@ at t=%.1fs → ready again after %.2fs", "\(fault)", seconds(at - t0), seconds(back - at)))
+        } else {
+            say("fault \(fault) at t=\(seconds(at - t0))s → NOT recovered")
+        }
+    }
+    camera.stop()
+    stateTask.cancel()
+    frameTask.cancel()
+    let recovered = faultLog.allSatisfy { f in readyAt.contains { $0 > f.1 } }
+    exit(failures == 0 && captures > 0 && recovered ? 0 : 1)
 }
 
 Task { @MainActor in await run() }

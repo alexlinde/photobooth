@@ -18,12 +18,15 @@ let package = Package(
         .target(name: "SonyCamera", dependencies: ["PTPKit"]),
         // Local save, persistent upload queue, Google OAuth + Photos Library client.
         .target(name: "Uploader"),
+        // Booth logic (state machine, config, key map, fake camera, scenarios): no AppKit/SwiftUI.
+        .target(name: "BoothCore", dependencies: ["SonyCamera"]),
         // The SwiftUI booth app.
-        .executableTarget(name: "PhotoBooth", dependencies: ["SonyCamera", "Uploader"]),
+        .executableTarget(name: "PhotoBooth", dependencies: ["BoothCore", "SonyCamera", "Uploader"]),
         // Phase 0 spike CLI.
         .executableTarget(name: "BoothSpike", dependencies: ["SonyCamera", "PTPKit"]),
         .testTarget(name: "PTPKitTests", dependencies: ["PTPKit"], resources: [.copy("Fixtures")]),
         .testTarget(name: "SonyCameraTests", dependencies: ["SonyCamera", "PTPKit"]),
+        .testTarget(name: "BoothCoreTests", dependencies: ["BoothCore"], path: "Tests/PhotoBoothTests"),
         .testTarget(name: "UploaderTests", dependencies: ["Uploader"]),
     ],
     swiftLanguageModes: [.v5]
