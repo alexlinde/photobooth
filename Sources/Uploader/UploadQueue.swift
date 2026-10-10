@@ -185,6 +185,18 @@ public actor UploadQueue {
         runTask = Task { [weak self] in await self?.runLoop() }
     }
 
+    /// Retry every pending item now instead of waiting out its backoff (e.g. right after
+    /// signing in to Google Photos).
+    public func retryNow() {
+        var any = false
+        for i in items.indices where items[i].state == .pending && items[i].nextAttemptAt != nil {
+            items[i].nextAttemptAt = nil
+            any = true
+        }
+        if any { changed() }
+        wakeCont.yield()
+    }
+
     public func stop() {
         runTask?.cancel(); runTask = nil
         monitorTask?.cancel(); monitorTask = nil

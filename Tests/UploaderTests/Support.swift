@@ -38,6 +38,14 @@ final class FakeClock: QueueClock, @unchecked Sendable {
     }
 }
 
+/// Time never advances: sleeps last until cancelled (the queue's wake signal cancels them).
+final class StuckClock: QueueClock, @unchecked Sendable {
+    func now() -> Date { Date(timeIntervalSince1970: 1_000_000) }
+    func sleep(seconds: TimeInterval) async throws {
+        try await Task.sleep(nanoseconds: 3_600_000_000_000)
+    }
+}
+
 final class FakePathMonitor: PathMonitoring, @unchecked Sendable {
     private let stream: AsyncStream<Bool>
     private let cont: AsyncStream<Bool>.Continuation

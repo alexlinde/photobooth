@@ -1,5 +1,6 @@
 import BoothCore
 import Foundation
+import Observation
 import SonyCamera
 import Uploader
 
@@ -7,13 +8,24 @@ import Uploader
 ///
 /// Uploading is optional: without `google_client.json` in the output root the booth just saves
 /// locally. With it but not yet signed in (`PhotoBooth --google-login`), photos queue up and
-/// upload once authorized — the queue retries `notAuthorized` every few minutes.
+/// upload once authorized — the queue retries `notAuthorized` every few minutes, or straight
+/// away after signing in from the control panel.
+///
+/// Observable for the control panel: the latest queue snapshot and the sign-in state.
 @MainActor
+@Observable
 final class UploadService {
     let eventDirectory: URL
     let albumTitle: String
-    let queue: UploadQueue?
-    private var watcher: Task<Void, Never>?
+    @ObservationIgnored let queue: UploadQueue?
+    @ObservationIgnored let auth: GoogleAuth?
+    /// Latest queue state (nil until the first report, or when uploads are off).
+    private(set) var snapshot: UploadQueueSnapshot?
+    /// nil = no google_client.json (uploads off).
+    private(set) var signedIn: Bool?
+    private(set) var signingIn = false
+    var signInError: String?
+    @ObservationIgnored private var watcher: Task<Void, Never>?
 
     static func clientConfigURL(_ config: BoothConfig) -> URL {
         config.outputRootURL.appendingPathComponent("google_client.json")
@@ -31,9 +43,12 @@ final class UploadService {
         guard let auth = Self.makeAuth(config) else {
             BoothLog.info(.storage, "No \(Self.clientConfigURL(config).path); Google Photos upload disabled (local save only)")
             queue = nil
+            self.auth = nil
             return
         }
-        if !auth.isAuthorized {
+        self.auth = auth
+        let authorized = auth.isAuthorized
+        if !authorized {
             BoothLog.error(.storage, "Google Photos not signed in — photos will queue until you run `PhotoBooth --google-login`")
         }
         let stateDir = config.outputRootURL.appendingPathComponent(".upload", isDirectory: true)
@@ -42,14 +57,16 @@ final class UploadService {
         let q = UploadQueue(stateURL: stateDir.appendingPathComponent("queue-\(config.eventFolderName).json"),
                             uploader: uploader)
         queue = q
+        signedIn = authorized
         let folder = eventDirectory
-        watcher = Task {
+        watcher = Task { [weak self] in
             // Catch photos saved but never enqueued (crash between the two), then run.
             await q.reconcile(folder: folder)
             await q.start()
             var last: UploadQueueSnapshot?
             for await s in q.updates() where s != last {
                 last = s
+                self?.snapshot = s
                 BoothLog.info(.storage, "Uploads: \(s.uploaded) done, \(s.pending) pending, \(s.inFlight) in flight, "
                     + "\(s.failedPermanently) failed\(s.isPausedOffline ? ", offline" : "")"
                     + (s.lastError.map { " — last error: \($0)" } ?? ""))
@@ -60,6 +77,25 @@ final class UploadService {
     func matches(_ config: BoothConfig) -> Bool {
         config.eventDirectoryURL == eventDirectory && config.albumName == albumTitle
             && (queue != nil) == FileManager.default.fileExists(atPath: Self.clientConfigURL(config).path)
+    }
+
+    /// Control panel "Sign in": the same browser flow as `--google-login`, then retries the
+    /// queue straight away.
+    func signIn() async {
+        guard let auth, !signingIn else { return }
+        signingIn = true
+        signInError = nil
+        defer { signingIn = false }
+        BoothLog.info(.storage, "Google sign-in started from the control panel")
+        do {
+            try await auth.authorizeInteractively()
+            BoothLog.info(.storage, "Google sign-in succeeded")
+        } catch {
+            BoothLog.error(.storage, "Google sign-in failed: \(error)")
+            signInError = "\(error)"
+        }
+        signedIn = auth.isAuthorized
+        if signedIn == true { await queue?.retryNow() }
     }
 
     func stop() {

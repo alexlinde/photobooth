@@ -1,4 +1,5 @@
 import Foundation
+import SonyCamera
 
 /// Booth configuration, loaded from `~/PhotoBooth/config.json` (or `--config PATH`).
 /// Missing or unknown keys fall back to defaults; wrong types / out-of-range values are
@@ -87,22 +88,26 @@ public struct BoothConfig: Codable, Equatable, Sendable {
     /// HID mode only: only accept presses from this USB device. `null` = any keyboard.
     public var buttonDevice: DeviceFilter? = .stealthSwitch3
     var debounceMs = 400
-    var countdownSeconds = 3
-    var reviewSeconds = 5.0
-    var shotsPerPress = 1
+    public var countdownSeconds = 3
+    public var reviewSeconds = 5.0
+    public var shotsPerPress = 1
     var pauseBetweenShotsSeconds = 2.0
     var outputRoot = "~/PhotoBooth"
     public var albumName = "Photo Booth"
     public var display = DisplaySelection.auto
     public var mirrorPreview = true
     public var idlePrompt = "Press the button!"
+    /// Camera profile applied on every (re)connect; `.none` leaves the camera's settings alone.
+    public var lighting = Lighting.strobes
+    /// Per-field overrides of the built-in profiles (see LightingProfiles.swift).
+    public var profiles = ProfileOverrides()
 
     public init() {}
 
     enum CodingKeys: String, CodingKey, CaseIterable {
         case eventName, buttonKey, buttonInput, buttonDevice, debounceMs, countdownSeconds
         case reviewSeconds, shotsPerPress, pauseBetweenShotsSeconds, outputRoot, albumName
-        case display, mirrorPreview, idlePrompt
+        case display, mirrorPreview, idlePrompt, lighting, profiles
     }
 
     public init(from decoder: Decoder) throws {
@@ -130,11 +135,41 @@ public struct BoothConfig: Codable, Equatable, Sendable {
         display = try c.decodeIfPresent(DisplaySelection.self, forKey: .display) ?? d.display
         mirrorPreview = try c.decodeIfPresent(Bool.self, forKey: .mirrorPreview) ?? d.mirrorPreview
         idlePrompt = try c.decodeIfPresent(String.self, forKey: .idlePrompt) ?? d.idlePrompt
+        lighting = try c.decodeIfPresent(Lighting.self, forKey: .lighting) ?? d.lighting
+        profiles = try c.decodeIfPresent(ProfileOverrides.self, forKey: .profiles) ?? d.profiles
+    }
+
+    /// Written explicitly so the file stays readable and round-trips: `buttonDevice: null`
+    /// is kept (a missing key means the default device), `profiles` only when it has overrides.
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(eventName, forKey: .eventName)
+        try c.encode(buttonKey, forKey: .buttonKey)
+        try c.encode(buttonInput, forKey: .buttonInput)
+        if let buttonDevice { try c.encode(buttonDevice, forKey: .buttonDevice) } else { try c.encodeNil(forKey: .buttonDevice) }
+        try c.encode(debounceMs, forKey: .debounceMs)
+        try c.encode(countdownSeconds, forKey: .countdownSeconds)
+        try c.encode(reviewSeconds, forKey: .reviewSeconds)
+        try c.encode(shotsPerPress, forKey: .shotsPerPress)
+        try c.encode(pauseBetweenShotsSeconds, forKey: .pauseBetweenShotsSeconds)
+        try c.encode(outputRoot, forKey: .outputRoot)
+        try c.encode(albumName, forKey: .albumName)
+        try c.encode(display, forKey: .display)
+        try c.encode(mirrorPreview, forKey: .mirrorPreview)
+        try c.encode(idlePrompt, forKey: .idlePrompt)
+        try c.encode(lighting, forKey: .lighting)
+        if !profiles.isEmpty { try c.encode(profiles, forKey: .profiles) }
     }
 
     // MARK: Derived / validated values
 
     public var key: KeySpec? { KeySpec.parse(buttonKey) }
+
+    /// The profile to apply: the built-in for `lighting` with `profiles` overrides merged on
+    /// top. `nil` = don't touch the camera.
+    public var cameraProfile: CameraProfile? {
+        lighting.builtin.map { profiles[lighting].applied(to: $0) }
+    }
     var debounce: Double { Double(debounceMs) / 1000 }
 
     /// `outputRoot` with `~` expanded.
@@ -154,7 +189,7 @@ public struct BoothConfig: Codable, Equatable, Sendable {
     public var eventDirectoryURL: URL { outputRootURL.appendingPathComponent(eventFolderName, isDirectory: true) }
 
     /// Returns human-readable problems; empty when valid.
-    func validationErrors() -> [String] {
+    public func validationErrors() -> [String] {
         var errs: [String] = []
         if key == nil {
             errs.append("buttonKey \"\(buttonKey)\" is not a known key name. Use e.g. \"space\", \"return\", \"f13\", \"b\", or a HID usage like \"hid:0x2c\". Run with --learn-key to find yours.")
@@ -172,8 +207,8 @@ public struct BoothConfig: Codable, Equatable, Sendable {
 
     static let defaultPath = "~/PhotoBooth/config.json"
 
-    /// Pretty JSON for the default file.
-    func encodedJSON() -> Data {
+    /// Pretty JSON, as written to config.json.
+    public func encodedJSON() -> Data {
         let enc = JSONEncoder()
         enc.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         return (try? enc.encode(self)) ?? Data("{}".utf8)
@@ -181,8 +216,12 @@ public struct BoothConfig: Codable, Equatable, Sendable {
 }
 
 public struct ConfigError: Error, Equatable, Sendable, CustomStringConvertible {
-    var path: String
-    var problems: [String]
+    public var path: String
+    public var problems: [String]
+    public init(path: String, problems: [String]) {
+        self.path = path
+        self.problems = problems
+    }
     public var description: String { "Problem with \(path):\n" + problems.map { "• " + $0 }.joined(separator: "\n") }
 }
 
@@ -215,12 +254,48 @@ public enum ConfigLoader {
         }
     }
 
+    /// Validates `config`, then writes it as pretty JSON atomically (control panel "Apply & Save").
+    /// The encoded JSON is decoded back first, so what's saved is exactly what the next load
+    /// sees. Throws `ConfigError` for invalid values or write failures.
+    public static func save(_ config: BoothConfig, path: String?) throws {
+        let p = resolvedPath(path)
+        let problems = config.validationErrors()
+        if !problems.isEmpty { throw ConfigError(path: p, problems: problems) }
+        let data = config.encodedJSON()
+        let (back, err) = decode(data, path: p)
+        if let err { throw err }
+        guard back == config else { throw ConfigError(path: p, problems: ["Internal error: settings don't round-trip through JSON."]) }
+        let url = URL(fileURLWithPath: p)
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try data.write(to: url, options: .atomic)
+        } catch {
+            throw ConfigError(path: p, problems: ["Could not write file: \(error.localizedDescription)"])
+        }
+        BoothLog.info(.config, "Saved config to \(p)")
+    }
+
+    /// Absolute path of the config file (`--config PATH` or the default).
+    public static func resolvedPath(_ path: String?) -> String {
+        ((path ?? BoothConfig.defaultPath) as NSString).expandingTildeInPath
+    }
+
     static func decode(_ data: Data, path: String = "config") -> (BoothConfig, ConfigError?) {
         do {
             let cfg = try JSONDecoder().decode(BoothConfig.self, from: data)
             if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 let known = Set(BoothConfig.CodingKeys.allCases.map(\.stringValue))
-                let unknown = obj.keys.filter { !known.contains($0) }.sorted()
+                var unknown = obj.keys.filter { !known.contains($0) }.sorted()
+                if let profiles = obj[BoothConfig.CodingKeys.profiles.stringValue] as? [String: Any] {
+                    let names = Set(ProfileOverrides.CodingKeys.allCases.map(\.stringValue))
+                    let fields = Set(ProfileField.allCases.map(\.stringValue))
+                    for (name, value) in profiles.sorted(by: { $0.key < $1.key }) {
+                        guard names.contains(name) else { unknown.append("profiles.\(name)"); continue }
+                        for k in ((value as? [String: Any])?.keys.sorted() ?? []) where !fields.contains(k) {
+                            unknown.append("profiles.\(name).\(k)")
+                        }
+                    }
+                }
                 if !unknown.isEmpty { BoothLog.info(.config, "Ignoring unknown config keys: \(unknown.joined(separator: ", "))") }
             }
             let problems = cfg.validationErrors()
