@@ -250,6 +250,7 @@ The tools are in `tools/stealthswitch3/` (run `./build.sh` there first; it build
 | `ssw_readonly_test.c` → `ssw_readonly_test` (x86_64) | Read-only exerciser. It does what the app does up to QueryInterface, then only cached getters, two standard GET_DESCRIPTORs and an interface enumeration. No open, no vendor or class request. |
 | `capture.sh` | Launcher. |
 | `ssw_proto.py` | Offline model. `encode <ssconfig>` predicts the image and request sequence; `decode-log <log>` reassembles and decodes captured downloads and checks the checksum. Sends nothing to any device. |
+| `sswprog` | Native programmer (`sswprog.c`). Dry run by default; `--write` sends the image per 2.2. See 7.1. |
 | `build.sh` | Rebuilds both binaries. |
 
 What `ssw_usbtrace.dylib` does:
@@ -347,3 +348,18 @@ A native arm64 replacement needs only:
 - The 8 control transfers in 2.2, carrying the image from section 3. 
 
 Timeouts can be looser than the app's 50/100 ms. No HID or kernel driver work is required, and no device state needs to be read first because the protocol is write-only.
+
+### 7.1 Programming without the app
+
+`tools/stealthswitch3/sswprog.c` (built by `build.sh`, universal arm64 + x86_64) implements the sequence in 2.2. Without `--write` it is a dry run that never opens the device.
+
+```
+sswprog keys                                  # accepted key names
+sswprog --selftest                            # encoder vs. the golden images in 6.4
+sswprog 1=printscreen                         # dry run: prints the 96-byte image + checksum
+sswprog 1=a 2=b 3=c 4=d 5=e --write           # program the switch
+sswprog --shift 5 1=a/b 5=shift               # 1: normal a, shifted b; switch 5 is the shift switch
+sswprog --ssconfig Default.ssconfig --write   # use a StealthSwitch3.app saved config
+```
+
+Add `--10` for the 10-switch product. Quit StealthSwitch3.app / RoboCon first if the seize fails. Exit code 0 means every call returned `kIOReturnSuccess` and all three status bytes were `0x01`.

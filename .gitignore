@@ -8,5 +8,6 @@ dist/
 tools/stealthswitch3/*.dylib
 tools/stealthswitch3/*.dSYM/
 tools/stealthswitch3/ssw_readonly_test
+tools/stealthswitch3/sswprog
 tools/stealthswitch3/captures/
 __pycache__/
