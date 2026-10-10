@@ -668,7 +668,9 @@ public enum BoothScenarios {
         // Table consistency: unique names, HID usages and key codes.
         try check(Set(KeyMap.entries.map(\.name)).count == KeyMap.entries.count, "duplicate key names")
         try check(Set(KeyMap.entries.map(\.hid)).count == KeyMap.entries.count, "duplicate HID usages")
-        let kcs = KeyMap.entries.compactMap(\.keyCode)
+        // Except Print Screen, which macOS delivers as F13 (keyCode 105): an intended alias.
+        let kcs = KeyMap.entries.filter { $0.name != "printscreen" }.compactMap(\.keyCode)
         try check(Set(kcs).count == kcs.count, "duplicate key codes")
+        try check(KeySpec.parse("printscreen")?.keyCode == 105, "printscreen works in focused-window mode")
     }
 }

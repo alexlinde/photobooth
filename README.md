@@ -103,7 +103,7 @@ Config lives at `~/PhotoBooth/config.json` and is created with defaults on first
     "vendorID" : "0x1324"
   },
   "buttonInput" : "hid",
-  "buttonKey" : "a",
+  "buttonKey" : "printscreen",
   "countdownSeconds" : 3,
   "debounceMs" : 400,
   "display" : "auto",
@@ -269,13 +269,14 @@ Open with **⌘,**, or by clicking PhotoBooth's Dock icon. Closing it doesn't qu
   TV and ignores presses (a countdown is aborted; a photo already being taken is saved); **Resume** returns.
 - **Recent photos:** the last 8; click one to open it; **Show folder** reveals the event folder in Finder.
 
-### The button also types
+### Button key: Print Screen
 
-The StealthSwitch is a USB keyboard, so its key reaches whatever app has focus too (e.g. an "a" in the
-control panel's album field). The app can't take the button exclusively: macOS only lets root seize a keyboard.
-Fix it at the source: program the StealthSwitch to send **F13** (H-Mod's configuration software; its Mac version predates current macOS, so use the Windows one on any PC — the setting is stored in the switch) and set
-`"buttonKey": "f13"`; F13 types nothing anywhere. Until then, just don't leave a text field focused.
-Opening the panel doesn't focus one.
+The StealthSwitch is a USB keyboard, so its key also reaches whatever app has focus, and the app can't take
+it exclusively (macOS only lets root seize a keyboard). So port 1 is programmed to **Print Screen** (in H-Mod's
+StealthSwitch3 app), which macOS sees as F13: it types nothing and triggers nothing. That's the default
+`"buttonKey": "printscreen"`. Avoid Scroll Lock and Pause (macOS treats them as F14/F15, screen brightness)
+and Insert (Help). A fresh switch ships sending "a"; until it's reprogrammed, set `"buttonKey": "a"` and
+don't leave a text field focused. See `docs/stealthswitch3-protocol.md` for programming it without H-Mod's app.
 
 | Screen | Meaning |
 |---|---|

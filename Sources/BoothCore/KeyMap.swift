@@ -100,7 +100,7 @@ public enum KeyMap {
         let fCodes: [UInt16] = [122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111]
         for i in 1...12 { e.append(Entry(name: "f\(i)", hid: 0x39 + UInt32(i), keyCode: fCodes[i - 1])) }
         e += [
-            Entry(name: "printscreen", hid: 0x46, keyCode: nil),
+            Entry(name: "printscreen", hid: 0x46, keyCode: 105), // macOS reports it as F13 (verified)
             Entry(name: "scrolllock", hid: 0x47, keyCode: nil),
             Entry(name: "pause", hid: 0x48, keyCode: nil),
             Entry(name: "insert", hid: 0x49, keyCode: 114), // kVK_Help
