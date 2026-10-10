@@ -1,15 +1,19 @@
 #!/bin/bash
 # Builds PhotoBooth in release mode and assembles + signs dist/PhotoBooth.app.
 #
-#   scripts/bundle.sh                     # ad-hoc signature
-#   SIGN_IDENTITY="PhotoBooth Dev" scripts/bundle.sh   # stable identity from your keychain
+#   scripts/bundle.sh                                  # Developer ID if present, else ad-hoc
+#   SIGN_IDENTITY="Developer ID Application: …" scripts/bundle.sh
+#   SIGN_IDENTITY=- scripts/bundle.sh                  # force ad-hoc
+#   NOTARY_PROFILE=photobooth scripts/bundle.sh        # also notarize + staple (see below)
 #
-# Signing note: an ad-hoc signature ("-s -") changes on every build, so macOS treats each
-# rebuild as a new app and TCC grants (Input Monitoring for the HID button, Removable
-# Volumes / camera access, ...) may have to be granted again after rebuilding. Creating a
-# stable self-signed code-signing certificate (Keychain Access → Certificate Assistant →
-# Create a Certificate…, type "Code Signing") and passing its name in SIGN_IDENTITY keeps
-# the designated requirement stable, so grants survive rebuilds.
+# Why a stable identity matters: macOS ties privacy grants (Input Monitoring for the HID
+# button, Removable Volumes for the camera) and Keychain access (the Google refresh token) to
+# the app's signature. An ad-hoc signature changes on every build, so each rebuild looks like
+# a new app and those prompts come back — a Keychain prompt would block an unattended booth.
+# A Developer ID (or a self-signed "Code Signing" certificate) keeps them across rebuilds.
+#
+# Notarization is only needed to run the app on another Mac (e.g. after downloading it). One-time
+# setup: xcrun notarytool store-credentials photobooth --apple-id <id> --team-id <team>
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -61,13 +65,27 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 PLIST
 
 echo "==> Signing"
-if [[ -n "${SIGN_IDENTITY:-}" ]]; then
-    codesign --force --options runtime --timestamp=none -s "$SIGN_IDENTITY" --identifier "$BUNDLE_ID" "$APP"
+if [[ -z "${SIGN_IDENTITY:-}" ]]; then
+    SIGN_IDENTITY="$(security find-identity -v -p codesigning | sed -n 's/.*"\(Developer ID Application: .*\)"/\1/p' | head -1)"
+fi
+if [[ -n "${SIGN_IDENTITY:-}" && "$SIGN_IDENTITY" != "-" ]]; then
+    echo "    $SIGN_IDENTITY"
+    # Hardened runtime + secure timestamp: required for notarization, harmless otherwise.
+    codesign --force --options runtime --timestamp -s "$SIGN_IDENTITY" --identifier "$BUNDLE_ID" "$APP"
 else
-    echo "    (ad-hoc; set SIGN_IDENTITY for a stable signature — see comment at top)"
+    echo "    ad-hoc (no Developer ID found; set SIGN_IDENTITY for a stable signature — see top)"
     codesign --force -s - --identifier "$BUNDLE_ID" "$APP"
 fi
 codesign --verify --verbose=2 "$APP"
 
+if [[ -n "${NOTARY_PROFILE:-}" ]]; then
+    echo "==> Notarizing (profile $NOTARY_PROFILE)"
+    ZIP="$ROOT/dist/PhotoBooth.zip"
+    ditto -c -k --keepParent "$APP" "$ZIP"
+    xcrun notarytool submit "$ZIP" --keychain-profile "$NOTARY_PROFILE" --wait
+    xcrun stapler staple "$APP"
+    rm -f "$ZIP"
+fi
+
 echo "==> Done: $APP"
-echo "    Run: open \"$APP\" --args --fake-camera --windowed"
+echo "    First run (grant permissions): open \"$APP\" --args --windowed"

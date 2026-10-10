@@ -23,6 +23,7 @@ Design notes and rationale are in `SPEC.md`.
 | File format | JPEG only (L, Fine or Extra Fine) |
 | Drive mode | Single |
 | Focus mode | **AF-S** (not AF-C: in the spike the camera in continuous AF reported "tracking focused") |
+| Priority Set in AF-S | **Balanced Emphasis** (or Release). With the default "AF", a full press without focus lock is ignored, so a low-contrast scene means no photo and an "Oops" screen |
 | Silent shooting / electronic shutter | **OFF** (otherwise strobes won't fire) |
 | Flash mode | Fill-flash |
 | Live View Display | Setting Effect **OFF** — must be set on the camera: the ZV-E10 accepts the USB command but ignores it. With it on, the preview is near-black at strobe exposure |
@@ -47,22 +48,26 @@ scripts/bundle.sh      # release build -> dist/PhotoBooth.app (signed)
 
 ### Signing
 
-`scripts/bundle.sh` signs ad-hoc by default. Set `SIGN_IDENTITY` to use a stable identity:
-
-```sh
-SIGN_IDENTITY="PhotoBooth Dev" scripts/bundle.sh
-```
+`scripts/bundle.sh` signs with the first **Developer ID Application** identity in your keychain
+(hardened runtime + secure timestamp), falling back to ad-hoc if there is none. Override with `SIGN_IDENTITY`
+(`SIGN_IDENTITY=-` forces ad-hoc).
 
 Why this matters: macOS ties privacy grants (Input Monitoring, Removable Volumes) and Keychain access to the
 app's code signature. An ad-hoc signature changes on every build, so each rebuild can re-trigger the permission
 prompts and a Keychain "wants to use confidential information" dialog. On an unattended booth that dialog
-blocks everything. Sign with a stable identity and the grants survive rebuilds.
+blocks everything. With a stable identity the grants survive rebuilds.
 
-Create a self-signed code-signing certificate once:
+No Developer ID? A self-signed certificate works for local use: Keychain Access -> Certificate Assistant ->
+**Create a Certificate...**, Identity Type Self Signed Root, Certificate Type **Code Signing**; pass its name as
+`SIGN_IDENTITY`.
 
-1. Keychain Access -> menu Keychain Access -> Certificate Assistant -> **Create a Certificate...**
-2. Name: `PhotoBooth Dev`. Identity Type: Self Signed Root. Certificate Type: **Code Signing**. Create.
-3. Use that name as `SIGN_IDENTITY`. (If the Keychain prompt appears at first launch, choose Always Allow.)
+Notarization is only needed to run the app on a different Mac (e.g. after downloading it). One-time setup, then
+build with `NOTARY_PROFILE`:
+
+```sh
+xcrun notarytool store-credentials photobooth --apple-id <apple-id> --team-id <team-id>
+NOTARY_PROFILE=photobooth scripts/bundle.sh
+```
 
 ## macOS permissions (one-time, per app identity)
 
