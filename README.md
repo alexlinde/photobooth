@@ -15,18 +15,23 @@ Design notes and rationale are in `SPEC.md`.
 - Ultimarc StealthSwitch 3 with a big arcade button on **port 1** (USB VID `0x1324` / PID `0x0103`;
   presents as keyboard + mouse)
 
-## Camera settings (set on the camera)
+## Camera settings
+
+With the default `"lighting": "strobes"` the app sets exposure mode, shutter, aperture, ISO, flash mode and
+compensation, focus mode, white balance and Live View Setting Effect over USB on every (re)connect (see
+[Lighting profiles](#lighting-profiles)); the control panel shows anything the camera refused. The table is the
+intended state; rows marked *(app)* are set by the profile, the rest must be set on the camera.
 
 | Setting | Value |
 |---|---|
-| Mode / exposure | M, 1/160 s, f/8, ISO 100 |
+| Mode / exposure *(app)* | M, 1/160 s, f/8, ISO 100 |
 | File format | JPEG only (L, Fine or Extra Fine) |
 | Drive mode | Single |
-| Focus mode | **AF-S** (not AF-C: in the spike the camera in continuous AF reported "tracking focused") |
+| Focus mode *(app)* | **AF-S** (not AF-C: in the spike the camera in continuous AF reported "tracking focused") |
 | Priority Set in AF-S | **Balanced Emphasis** (or Release). With the default "AF", a full press without focus lock is ignored, so a low-contrast scene means no photo and an "Oops" screen |
 | Silent shooting / electronic shutter | **OFF** (otherwise strobes won't fire) |
-| Flash mode | Fill-flash |
-| Live View Display | Setting Effect **OFF** — must be set on the camera: the ZV-E10 accepts the USB command but ignores it. With it on, the preview is near-black at strobe exposure |
+| Flash mode *(app)* | Fill-flash |
+| Live View Display *(app)* | Setting Effect **OFF** (writable over USB in M/A/S/P). With it on, the preview is near-black at strobe exposure |
 | USB Connection | **PC Remote** |
 | PC Remote save destination | PC only (or PC + Camera) |
 | **Power Save / Auto Power Off** | **DISABLED** |
@@ -108,6 +113,7 @@ Config lives at `~/PhotoBooth/config.json` and is created with defaults on first
   "outputRoot" : "~/PhotoBooth",
   "pauseBetweenShotsSeconds" : 2,
   "reviewSeconds" : 5,
+  "lighting" : "strobes",
   "shotsPerPress" : 1
 }
 ```
@@ -127,6 +133,8 @@ Config lives at `~/PhotoBooth/config.json` and is created with defaults on first
 | `display` | `"auto"` (external display if present, else main), `"main"`, an integer index, or a case-insensitive part of the display name (e.g. `"LG"`) |
 | `mirrorPreview` | Mirror the live preview (the review photo is never mirrored) |
 | `idlePrompt` | Text on the idle screen |
+| `lighting` | `"strobes"` (default), `"ambient"`, or `"none"` (don't touch the camera's settings). See below |
+| `profiles` | Optional per-field overrides of the built-in profiles. Written only when there are overrides |
 
 **Button key names:** `a`-`z`, `0`-`9`, `space`, `return`, `enter`, `tab`, `escape`, `delete`, arrows, `home`,
 `end`, `pageup`, `pagedown`, `f1`-`f24`, `kp0`-`kp9`, punctuation, or a raw HID usage like `hid:0x2c`
@@ -136,7 +144,50 @@ Config lives at `~/PhotoBooth/config.json` and is created with defaults on first
 and the window shows the HID usage, macOS key code, source device, and the exact `buttonKey` value to put in
 config.json. Quit with Cmd+Q.
 
-**Reload live:** Ctrl+Opt+Cmd+R reloads config.json without restarting.
+**Reload live:** Ctrl+Opt+Cmd+R reloads config.json without restarting (and re-applies the lighting profile).
+Most settings can also be edited in the [control panel](#control-panel), which saves config.json for you.
+
+### Lighting profiles
+
+The booth applies a camera profile on every (re)connect, so it doesn't depend on how someone left the camera's
+menus. Built-ins:
+
+| Setting | `strobes` | `ambient` |
+|---|---|---|
+| Exposure mode | manual | aperture priority |
+| Shutter | 1/160 | (camera) |
+| Aperture | f/8 | f/5.6 |
+| ISO | 100 | auto |
+| Exposure compensation | (locked in M) | 0 |
+| Flash | fill, 0 EV | (camera; the ZV-E10 keeps its flash mode in A) |
+| Focus | AF-S | AF-S |
+| White balance | auto | auto |
+| Live View Setting Effect | off (bright preview) | on (preview shows the real exposure) |
+
+Override individual fields of either profile:
+
+```json
+"lighting": "strobes",
+"profiles": {
+  "strobes": {"shutter": "1/160", "aperture": 8, "iso": 100, "flashCompensation": -0.3},
+  "ambient": {"aperture": 4, "iso": "auto"}
+}
+```
+
+| Key | Values |
+|---|---|
+| `exposureMode` | `"manual"`, `"aperture"`, `"shutter"`, `"program"` |
+| `shutter` | `"1/160"`, `"1/4000"`, `"0.5"`, `"2"`, `"30"` (1/8000 to 30 s) |
+| `aperture` | number, e.g. `8` or `5.6` |
+| `iso` | number (e.g. `100`) or `"auto"` |
+| `exposureCompensation`, `flashCompensation` | EV, e.g. `-0.3` (±5 / ±3). Exposure compensation is ignored in manual |
+| `flash` | `"off"`, `"fill"`, `"auto"`, `"slowSync"`, `"rearSync"` |
+| `focus` | `"af-s"`, `"af-c"`, `"af-a"`, `"dmf"`, `"mf"` |
+| `whiteBalance` | `"auto"`, `"daylight"`, `"shade"`, `"cloudy"`, `"tungsten"`, `"flash"` |
+| `settingEffect` | `true` / `false` |
+
+Bad values show on the attendant screen like any other config error. While config.json has an error the booth
+runs on defaults but leaves the camera's settings alone until the file is fixed.
 
 ## Google Photos upload (optional)
 
@@ -171,6 +222,49 @@ Fallback (per SPEC): in Google Photos on the web, use "Back up folders" on the e
 Launch `dist/PhotoBooth.app` (or `open dist/PhotoBooth.app`). It goes full-screen on the selected display,
 hides the cursor, and prevents display sleep while running.
 
+### Two screens: TV for guests, laptop for the attendant
+
+1. Connect the TV and set **System Settings -> Displays** to **Extend** (not Mirror). Mirroring gives one
+   display, and the booth runs single-screen.
+2. The booth goes on the display `display` picks (`"auto"` = the external one), at kiosk level, without taking
+   keyboard focus. The control panel opens on the other display, preferably the laptop's own.
+3. The laptop stays usable: Dock and menu bar stay, and the cursor is hidden only while it's over the TV.
+   (macOS only hides it while PhotoBooth is the active app.)
+
+Plugging the TV in or out mid-event re-arranges the windows by itself. Lid closed with only the TV attached, the
+booth runs single-screen.
+
+**Single screen** (one display, or mirroring): the booth is a full kiosk exactly as before. **⌘,** opens the
+control panel on top; while it's open the booth drops below other windows and the cursor shows. Close the panel
+to go back to kiosk mode.
+
+### Control panel
+
+Open with **⌘,**, or by clicking PhotoBooth's Dock icon. Closing it doesn't quit (Cmd+Q does).
+
+- **Status:** booth state, camera connection, lighting profile (applying, applied, or which settings the camera
+  refused and why), what the camera reports (mode, shutter, aperture, ISO, flash, focus, battery), button
+  (connected, HID or focused-window fallback, seized or not), uploads (done / pending / failed, offline, last
+  error), Google Photos sign-in (**Sign in…** runs the same browser flow as `--google-login`, then retries the
+  queue). An attendant issue shows here with a **Reset** button.
+- **Lighting:** Strobes / Ambient / Don't change camera, with a disclosure to edit the selected profile's fields
+  (choosing the built-in value removes the override).
+- **Booth:** event name, album, countdown, review time, photos per press, idle prompt, mirror preview.
+- **Apply & Save** (⌘S) validates, writes config.json and applies it the same way as Ctrl+Opt+Cmd+R.
+  **Revert** discards edits. **Test shot** presses the button. **Pause booth** shows "Back in a moment" on the
+  TV and ignores presses (a countdown is aborted; a photo already being taken is saved); **Resume** returns.
+- **Recent photos:** the last 8; click one to open it; **Show folder** reveals the event folder in Finder.
+
+### Button seize
+
+With `buttonDevice` set (the default) and HID input, the app tries to open the button **exclusively**
+(`kIOHIDOptionsTypeSeizeDevice`), so its "a" doesn't also type into whatever has focus, such as the control
+panel's album field. It never seizes without a `buttonDevice` filter (that would capture every keyboard) or in
+`--learn-key` mode. If macOS refuses (the log shows `IOHIDManagerOpen(seize) failed`, and the panel shows "the
+button also types into the focused app"), the app opens normally and the button still works. On macOS 26 a
+normal user process gets `0xE00002C1` (not privileged), so expect this; just don't leave a text field focused in
+the panel. Opening the panel doesn't focus a text field.
+
 | Screen | Meaning |
 |---|---|
 | "Getting the camera ready..." | Waiting for the camera (off, wrong USB mode, or permission missing). It reconnects by itself. |
@@ -179,9 +273,11 @@ hides the cursor, and prevents display sleep while running.
 | White flash | The shutter fired. |
 | Review ("Saved!") | The photo, not mirrored, for `reviewSeconds`; then back to idle. |
 | "Oops - let's try that again" | A capture failed; returns to idle after a moment. |
-| **ATTENDANT NEEDED** | Repeated failures or a config / storage / permission problem. Fix it, then press Ctrl+Opt+Cmd+R. |
+| **ATTENDANT NEEDED** | Repeated failures or a config / storage / permission problem. Fix it, then press Ctrl+Opt+Cmd+R (or Reset in the control panel). |
+| "Back in a moment" | Paused from the control panel; presses are ignored. |
 
-Attendant keys: **Ctrl+Opt+Cmd+Q** quit, **Ctrl+Opt+Cmd+R** retry / reload config. Cmd+Q also quits.
+Attendant keys: **Ctrl+Opt+Cmd+Q** quit, **Ctrl+Opt+Cmd+R** retry / reload config, **⌘,** control panel.
+Cmd+Q also quits.
 Esc does nothing. (Ctrl+Opt+Cmd+D simulates a camera disconnect, fake camera only.)
 
 Logs: `~/PhotoBooth/logs/booth-YYYYMMDD.log`, and live with
@@ -194,7 +290,8 @@ Logs: `~/PhotoBooth/logs/booth-YYYYMMDD.log`, and live with
 - [ ] Button learned (`--learn-key`) and `buttonKey` set; `eventName` / `albumName` set
 - [ ] Permissions granted (Removable Volumes, Input Monitoring, Keychain) for the exact signed app you will run
 - [ ] Google signed in, and a test photo appears in the shared album
-- [ ] TV placement and `display` setting verified
+- [ ] TV placement and `display` setting verified; Displays set to Extend; control panel on the laptop
+- [ ] Control panel shows the lighting profile applied (no refused settings) and the button connected
 - [ ] Free disk space on the Mac
 
 ## Development
@@ -209,8 +306,9 @@ Modules:
 - `BoothSpike`: hardware spike / soak CLI (`booth-spike`)
 
 `PhotoBooth` flags: `--windowed`, `--fake-camera`, `--fake-fail-rate X`, `--config PATH`, `--learn-key`,
-`--google-login`, `--self-test` (runs the 12 state-machine scenarios), `--auto-press SECONDS`,
-`--print-window-id`, `--snapshot-dir DIR`. Develop without hardware:
+`--google-login`, `--self-test` (runs the state-machine scenarios), `--auto-press SECONDS`,
+`--print-window-id`, `--snapshot-dir DIR` (PNGs of the booth window and the control panel after each state change,
+plus a full-height render of the panel). Develop without hardware (booth and control panel as normal windows):
 
 ```sh
 swift run PhotoBooth --windowed --fake-camera

@@ -3,10 +3,12 @@ import AppKit
 import SonyCamera
 import SwiftUI
 
-/// Borderless window that can take key focus (needed for local key monitoring).
+/// Borderless booth window. Takes key focus in single-screen kiosk mode (needed for local key
+/// monitoring); never in two-screen mode, so the control panel keeps the keyboard.
 final class KioskWindow: NSWindow {
-    override var canBecomeKey: Bool { true }
-    override var canBecomeMain: Bool { true }
+    var acceptsKey = true
+    override var canBecomeKey: Bool { acceptsKey }
+    override var canBecomeMain: Bool { acceptsKey }
 }
 
 /// Hosting view that shows a blank cursor over the whole window in kiosk mode.
@@ -22,8 +24,17 @@ final class KioskHostingView<Content: View>: NSHostingView<Content> {
     }
 }
 
+/// Window arrangement:
+/// - `windowed` (--windowed): booth and control panel are ordinary windows (development).
+/// - `kiosk`: one display. The booth covers it above the menu bar, Dock and menu bar hidden,
+///   cursor hidden. ⌘, opens the panel on top; while it's open the booth drops to normal
+///   level and the cursor shows (as on the attendant screen).
+/// - `twoScreen`: the booth covers the TV at kiosk level but never takes key focus; the
+///   panel is a normal window on the other display (normally the laptop's). Dock and menu bar
+///   stay; the cursor hides only while it's over the TV.
+/// The layout is recomputed on every display change, so plugging the TV in mid-event works.
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let options: AppOptions
     private var config = BoothConfig()
     private var configError: ConfigError?
@@ -41,6 +52,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var cursorHidden = false
     private var kiosk: Bool { !options.windowed }
 
+    private var layout: ScreenLayout?
+    private var panelModel: ControlPanelModel?
+    private var panelWindow: NSWindow?
+    /// Display the panel was last placed on (so reopening it doesn't move it).
+    private var panelScreenID: UInt32?
+    private var pointerMonitors: [Any] = []
+
+    private enum Presentation { case windowed, kiosk, twoScreen }
+    private var presentation: Presentation {
+        if !kiosk { return .windowed }
+        return layout?.panel != nil ? .twoScreen : .kiosk
+    }
+    private var panelVisible: Bool { panelWindow?.isVisible == true }
+
     init(options: AppOptions) {
         self.options = options
     }
@@ -52,36 +77,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         FileLog.shared.configure(directory: config.outputRootURL.appendingPathComponent("logs", isDirectory: true))
         BoothLog.info(.app, "PhotoBooth launching (\(options.windowed ? "windowed" : "kiosk"), \(options.fakeCamera ? "fake camera" : "real camera")\(options.learnKey ? ", learn-key" : ""))")
         if let e = configError { BoothLog.error(.config, e.description) }
-        else { BoothLog.info(.config, "Config: event \"\(config.eventName)\", key \(config.key?.description ?? "?"), input \(config.buttonInput.rawValue)") }
+        else { BoothLog.info(.config, "Config: event \"\(config.eventName)\", key \(config.key?.description ?? "?"), input \(config.buttonInput.rawValue), lighting \(config.lighting.rawValue)") }
 
         NSApp.mainMenu = makeMainMenu()
         sleepAssertion = SleepAssertion()
+        layout = computeLayout()
         makeWindow()
 
         if options.learnKey { startLearnKey() } else { startBooth() }
 
         let nc = NotificationCenter.default
         nc.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated {
-                BoothLog.info(.ui, "Screen configuration changed: \(NSScreen.screens.map(\.localizedName))")
-                self?.placeWindow()
-                self?.enforceKiosk()
-            }
+            MainActor.assumeIsolated { self?.screensChanged() }
         }
         nc.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.enforceKiosk() }
         }
+        if kiosk { installPointerMonitors() }
 
-        window.makeKeyAndOrderFront(nil)
+        switch presentation {
+        case .twoScreen:
+            window.orderFrontRegardless()
+            showPanel()
+        case .kiosk:
+            window.makeKeyAndOrderFront(nil)
+        case .windowed:
+            window.makeKeyAndOrderFront(nil)
+            if panelModel != nil {
+                showPanel()
+                window.makeKeyAndOrderFront(nil)
+            }
+        }
         NSApp.activate(ignoringOtherApps: true)
+        updateBoothLevel()
         enforceKiosk()
         if options.printWindowID {
             print("WINDOW_ID \(window.windowNumber)")
             fflush(stdout)
         }
+        if options.snapshotDir != nil, panelModel != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+                MainActor.assumeIsolated { self?.snapshotPanel(label: "panel-launch", full: true) }
+            }
+        }
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    /// Closing the control panel must not quit; Cmd+Q (or the attendant shortcut) does.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    /// Dock icon click: bring back the control panel.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        guard panelModel != nil else { return true }
+        showPanel()
+        return false
+    }
 
     func applicationWillTerminate(_ notification: Notification) {
         BoothLog.info(.app, "PhotoBooth quitting")
@@ -90,7 +139,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller?.stop()
         uploads?.stop()
         sleepAssertion?.release()
-        if cursorHidden { NSCursor.unhide() }
+        for m in pointerMonitors { NSEvent.removeMonitor(m) }
+        pointerMonitors = []
+        setCursorHidden(false)
         FileLog.shared.flush()
     }
 
@@ -100,6 +151,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let clock = SystemBoothClock()
         let camera = CameraFactory.make(options: options, clock: clock)
         self.camera = camera
+        // A config with errors runs on defaults; don't push the default profile onto a camera
+        // someone set up by hand. Applied once the config is fixed and reloaded.
+        if configError == nil { camera.setProfile(config.cameraProfile) }
         let maxPixel = Int(maxScreenPixelDimension())
         let controller = BoothController(camera: camera, sink: makeSink(config), clock: clock,
                                          settings: BoothSettings(config),
@@ -116,6 +170,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         boothHost = host
         window.contentView = host
 
+        let model = ControlPanelModel(controller: controller, camera: camera, config: config,
+                                      configPath: ConfigLoader.resolvedPath(options.configPath))
+        model.uploads = uploads
+        model.loadError = configError
+        model.onSave = { [weak self] cfg in self?.saveConfig(cfg) }
+        panelModel = model
+
         let input = ButtonInput(key: config.key, mode: config.buttonInput, deviceFilter: config.buttonDevice)
         input.onPress = { [weak self] in
             guard let self, let c = self.controller else { return }
@@ -124,12 +185,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         input.onShortcut = { [weak self] s in self?.handleShortcut(s) }
         input.onStatusChange = { [weak self] s in self?.inputStatusChanged(s) }
+        input.isBoothEvent = { [weak self] e in e.window == nil || e.window === self?.window }
         self.input = input
         input.start()
         inputStatusChanged(input.status)
 
         controller.start()
         if let e = configError { controller.raiseAttendant(.config(e.description)) }
+        model.refreshPhotos()
 
         if let every = options.autoPress {
             autoPressTimer = Timer.scheduledTimer(withTimeInterval: every, repeats: true) { [weak self] _ in
@@ -150,6 +213,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if uploads?.matches(config) != true {
             uploads?.stop()
             uploads = UploadService(config: config)
+            panelModel?.uploads = uploads
         }
         return UploadingPhotoSink(local: LocalFolderPhotoSink(directory: config.eventDirectoryURL),
                                   queue: uploads?.queue)
@@ -157,20 +221,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var snapshotIndex = 0
 
-    /// Dev aid (--snapshot-dir): renders the window contents to PNG, including the
+    /// Dev aid (--snapshot-dir): renders the booth window contents to PNG, including the
     /// live-preview layer.
     private func snapshot(label: String) {
-        guard let dir = options.snapshotDir, let view = window.contentView else { return }
+        guard let view = window.contentView else { return }
+        writeSnapshot(of: view, scale: window.backingScaleFactor, label: label, renderLayer: true)
+    }
+
+    /// Dev aid (--snapshot-dir): renders the control panel as shown and, with `full`, the
+    /// whole form (disclosure expanded) in a tall offscreen window.
+    private func snapshotPanel(label: String, full: Bool = false) {
+        guard options.snapshotDir != nil, let panelWindow, let model = panelModel else { return }
+        if panelWindow.isVisible, let view = panelWindow.contentView {
+            writeSnapshot(of: view, scale: panelWindow.backingScaleFactor, label: label)
+        }
+        guard full else { return }
+        let expanded = model.profileExpanded
+        model.profileExpanded = true
+        let w = NSWindow(contentRect: NSRect(x: -10000, y: -10000, width: 520, height: 2000),
+                         styleMask: [.borderless], backing: .buffered, defer: false)
+        w.isReleasedWhenClosed = false
+        let host = NSHostingView(rootView: ControlPanelView(model: model))
+        w.contentView = host
+        w.orderFrontRegardless()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+            MainActor.assumeIsolated {
+                self?.writeSnapshot(of: host, scale: w.backingScaleFactor, label: label + "-full")
+                w.orderOut(nil)
+                model.profileExpanded = expanded
+            }
+        }
+    }
+
+    /// `renderLayer` captures the live-preview layer; the panel's scroll views come out
+    /// flipped that way, so it uses `cacheDisplay` alone.
+    private func writeSnapshot(of view: NSView, scale: CGFloat, label: String, renderLayer: Bool = false) {
+        guard let dir = options.snapshotDir else { return }
         snapshotIndex += 1
         let name = String(format: "%02d-%@.png", snapshotIndex, label.replacingOccurrences(of: "/", with: "of"))
-        let scale = window.backingScaleFactor
         let size = view.bounds.size
-        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(size.width * scale), pixelsHigh: Int(size.height * scale),
+        guard size.width > 0, size.height > 0,
+              let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(size.width * scale), pixelsHigh: Int(size.height * scale),
                                          bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
                                          colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0),
               let ctx = NSGraphicsContext(bitmapImageRep: rep) else { return }
         rep.size = size
-        view.layer?.render(in: ctx.cgContext)
+        if renderLayer { view.layer?.render(in: ctx.cgContext) }
         // Fallback for content not captured by layer rendering.
         view.cacheDisplay(in: view.bounds, to: rep)
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
@@ -182,15 +278,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let label = s.label
             let delay = { if case .capturing = s { return 0.08 } else { return 0.6 } }()
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                MainActor.assumeIsolated { self?.snapshot(label: label) }
+                MainActor.assumeIsolated {
+                    self?.snapshot(label: label)
+                    self?.snapshotPanel(label: "panel-" + label)
+                }
             }
         }
-        // Drop below other windows' level while the attendant needs to use System Settings etc.
-        guard kiosk else { return }
-        if case .attendant = s { window.level = .normal } else { window.level = Self.kioskLevel }
+        if case .review = s { panelModel?.refreshPhotos() }
+        updateBoothLevel()
     }
 
     private func inputStatusChanged(_ s: ButtonInput.Status) {
+        panelModel?.button = s
         guard let controller else { return }
         if let reason = s.fallbackReason {
             controller.inputBanner = "Button works only while this window is focused — " + reason
@@ -220,18 +319,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Control panel "Apply & Save": write config.json, then apply it exactly like a reload.
+    private func saveConfig(_ cfg: BoothConfig) -> ConfigError? {
+        do {
+            try ConfigLoader.save(cfg, path: options.configPath)
+        } catch let e as ConfigError {
+            BoothLog.error(.config, "Save failed: \(e)")
+            return e
+        } catch {
+            return ConfigError(path: ConfigLoader.resolvedPath(options.configPath), problems: ["\(error)"])
+        }
+        reloadConfig()
+        return configError
+    }
+
     private func reloadConfig() {
         let (cfg, err) = ConfigLoader.load(path: options.configPath)
         if let err {
             BoothLog.error(.config, "Reload failed: \(err)")
             configError = err
+            panelModel?.loadError = err
             controller?.raiseAttendant(.config(err.description))
             return
         }
+        // Every successful reload (Ctrl+Opt+Cmd+R, Apply & Save) re-applies the profile, which
+        // also fixes settings someone changed on the camera.
+        camera?.setProfile(cfg.cameraProfile)
+        panelModel?.configApplied(cfg)
         let wasError = configError != nil
         configError = nil
         guard cfg != config || wasError else { return }
-        BoothLog.info(.config, "Config reloaded")
+        BoothLog.info(.config, "Config reloaded (lighting \(cfg.lighting.rawValue))")
         config = cfg
         FileLog.shared.configure(directory: cfg.outputRootURL.appendingPathComponent("logs", isDirectory: true))
         if let controller {
@@ -242,7 +360,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             boothHost?.rootView = BoothRootView(controller: controller, preview: preview!, idlePrompt: cfg.idlePrompt)
         }
         input?.reconfigure(key: cfg.key, mode: cfg.buttonInput, deviceFilter: cfg.buttonDevice)
-        placeWindow()
+        screensChanged()
     }
 
     // MARK: Learn key
@@ -279,9 +397,85 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.status = input.status.mode == .hid ? "Listening to all keyboards via HID (works in the background)." : (input.status.fallbackReason ?? "") + " " + ButtonInput.permissionHelp
     }
 
-    // MARK: Window / kiosk
+    // MARK: Screens / layout
 
     private static let kioskLevel = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 1)
+
+    static func displayID(_ s: NSScreen) -> UInt32 {
+        (s.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0
+    }
+
+    private static func descriptors() -> [ScreenDescriptor] {
+        NSScreen.screens.enumerated().map { i, s in
+            let id = displayID(s)
+            return ScreenDescriptor(id: id, name: s.localizedName, frame: s.frame,
+                                    isBuiltin: CGDisplayIsBuiltin(CGDirectDisplayID(id)) != 0, isMain: i == 0)
+        }
+    }
+
+    private static func screen(_ d: ScreenDescriptor) -> NSScreen? {
+        NSScreen.screens.first { displayID($0) == d.id }
+    }
+
+    private func computeLayout() -> ScreenLayout? {
+        let l = ScreenLayout.compute(screens: Self.descriptors(), selection: config.display)
+        if let l {
+            switch l {
+            case .singleScreen(let b): BoothLog.info(.ui, "Layout: single screen, booth on \(b)")
+            case .twoScreen(let b, let p): BoothLog.info(.ui, "Layout: two screens, booth on \(b), control panel on \(p)")
+            }
+        }
+        return l
+    }
+
+    /// Display added/removed/rearranged (or config reloaded): re-place and re-mode the windows.
+    private func screensChanged() {
+        BoothLog.info(.ui, "Screens: \(NSScreen.screens.map(\.localizedName))")
+        let wasTwoScreen = presentation == .twoScreen
+        let new = computeLayout()
+        guard kiosk else { layout = new; return }
+        layout = new
+        placeWindow()
+        if presentation == .twoScreen {
+            if !wasTwoScreen {
+                // TV plugged in: the panel moves to the laptop and the booth stops taking focus.
+                showPanel()
+            } else if let panelWindow, panelVisible, let p = layout?.panel, panelScreenID != p.id {
+                placePanel(panelWindow)
+            }
+        } else if wasTwoScreen, panelVisible {
+            // TV gone: the booth is back on this display, under the still-open panel.
+            panelWindow?.level = .floating
+        }
+        updateBoothLevel()
+        enforceKiosk()
+    }
+
+    /// Kiosk: cover the booth display completely; take key focus only in single-screen mode.
+    private func placeWindow() {
+        guard kiosk, let window, let layout else { return }
+        let frame = Self.screen(layout.booth)?.frame ?? layout.booth.frame
+        if window.frame != frame {
+            BoothLog.info(.ui, "Placing booth on display \"\(layout.booth.name)\" \(frame)")
+            window.setFrame(frame, display: true)
+        }
+        if let k = window as? KioskWindow {
+            k.acceptsKey = presentation != .twoScreen
+            if !k.acceptsKey, k.isKeyWindow { panelWindow?.makeKey() }
+        }
+    }
+
+    /// Booth window level: kiosk level, except in single-screen mode while the attendant needs
+    /// the rest of the screen (attendant screen, control panel open).
+    private func updateBoothLevel() {
+        guard kiosk, let window else { return }
+        var level = Self.kioskLevel
+        if presentation == .kiosk {
+            let attendant: Bool = { if case .attendant = controller?.state { return true } else { return false } }()
+            if attendant || panelVisible { level = .normal }
+        }
+        if window.level != level { window.level = level }
+    }
 
     private func makeWindow() {
         if kiosk {
@@ -290,6 +484,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
             w.isMovable = false
             w.hasShadow = false
+            w.acceptsMouseMovedEvents = true
             window = w
         } else {
             let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1280, height: 720),
@@ -301,38 +496,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         window.backgroundColor = .black
         window.isReleasedWhenClosed = false
+        window.delegate = self
         placeWindow()
-    }
-
-    /// Kiosk: cover the configured display (falling back to main) completely.
-    private func placeWindow() {
-        guard kiosk, let window else { return }
-        guard let screen = Self.pickScreen(config.display) ?? NSScreen.screens.first else { return }
-        if window.frame != screen.frame {
-            BoothLog.info(.ui, "Placing booth on display \"\(screen.localizedName)\" \(screen.frame)")
-            window.setFrame(screen.frame, display: true)
-        }
-    }
-
-    static func pickScreen(_ sel: BoothConfig.DisplaySelection) -> NSScreen? {
-        let screens = NSScreen.screens
-        switch sel {
-        case .main:
-            return screens.first
-        case .index(let i):
-            return screens.indices.contains(i) ? screens[i] : nil
-        case .name(let n):
-            return screens.first { $0.localizedName.localizedCaseInsensitiveContains(n) }
-        case .auto:
-            let external = screens.filter { !isBuiltin($0) }
-            // Prefer an external display that isn't the menu-bar one (Mac mini + monitor + TV).
-            return external.first { $0 != screens.first } ?? external.first ?? screens.first
-        }
-    }
-
-    private static func isBuiltin(_ s: NSScreen) -> Bool {
-        guard let n = s.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return false }
-        return CGDisplayIsBuiltin(CGDirectDisplayID(n.uint32Value)) != 0
     }
 
     private func maxScreenPixelDimension() -> CGFloat {
@@ -340,23 +505,180 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return max(1920, dims.max() ?? 3840)
     }
 
-    /// Re-assert kiosk presentation and hide the cursor (after activation / screen changes).
+    // MARK: Control panel window
+
+    @objc func showControlPanel(_ sender: Any?) { showPanel() }
+
+    private func showPanel() {
+        guard let model = panelModel else { return }
+        let isNew = panelWindow == nil
+        let w = panelWindow ?? makePanelWindow(model)
+        if isNew {
+            // Don't start with the cursor in a text field: an unseized button would type into it.
+            DispatchQueue.main.async { w.makeFirstResponder(nil) }
+        }
+        // Single-screen kiosk: float above the (lowered) booth so a click on it doesn't bury the panel.
+        w.level = presentation == .kiosk ? .floating : .normal
+        if !w.isVisible || presentation == .twoScreen { placePanel(w) }
+        model.refreshPhotos()
+        w.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        panelVisibilityChanged()
+    }
+
+    private func makePanelWindow(_ model: ControlPanelModel) -> NSWindow {
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 800),
+                         styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
+        w.title = "PhotoBooth Control Panel"
+        w.contentMinSize = NSSize(width: 460, height: 480)
+        w.isReleasedWhenClosed = false
+        w.acceptsMouseMovedEvents = true
+        w.collectionBehavior = [.fullScreenAuxiliary]
+        w.contentView = NSHostingView(rootView: ControlPanelView(model: model))
+        w.delegate = self
+        panelWindow = w
+        return w
+    }
+
+    /// Two-screen: centred on the panel display (once per display, so the attendant can move
+    /// it). Single-screen: centred on the booth display. Windowed: beside the booth window.
+    private func placePanel(_ w: NSWindow) {
+        let target: NSScreen?
+        switch presentation {
+        case .twoScreen: target = layout?.panel.flatMap(Self.screen)
+        case .kiosk: target = layout.flatMap { Self.screen($0.booth) }
+        case .windowed: target = window.screen ?? NSScreen.main
+        }
+        guard let target else { return }
+        let id = Self.displayID(target)
+        if panelScreenID == id, w.frame.intersects(target.visibleFrame) { return }
+        panelScreenID = id
+        let vf = target.visibleFrame
+        let size = NSSize(width: min(520, vf.width - 40), height: min(800, vf.height - 40))
+        var origin = NSPoint(x: vf.midX - size.width / 2, y: vf.midY - size.height / 2)
+        if presentation == .windowed, window.frame.maxX + 12 + size.width <= vf.maxX {
+            origin = NSPoint(x: window.frame.maxX + 12, y: max(vf.minY, window.frame.maxY - size.height))
+        }
+        BoothLog.info(.ui, "Placing control panel on display \"\(target.localizedName)\"")
+        w.setFrame(NSRect(origin: origin, size: size), display: true)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard let w = notification.object as? NSWindow else { return }
+        if w === panelWindow {
+            // isVisible is still true during this callback.
+            DispatchQueue.main.async { [weak self] in
+                MainActor.assumeIsolated { self?.panelVisibilityChanged() }
+            }
+        } else if w === window, !kiosk {
+            NSApp.terminate(nil)  // --windowed: closing the booth window quits, as before
+        }
+    }
+
+    /// Panel opened/closed. Single-screen kiosk: lower the booth and show the cursor while
+    /// it's open; restore kiosk mode when it closes.
+    private func panelVisibilityChanged() {
+        updateBoothLevel()
+        enforceKiosk()
+        if presentation == .kiosk, !panelVisible {
+            window.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    // MARK: Cursor / kiosk presentation
+
+    /// Re-assert the presentation for the current mode (after activation / screen changes).
     private func enforceKiosk() {
         guard kiosk else { return }
-        NSApp.presentationOptions = [.hideDock, .hideMenuBar]
-        if cursorHidden { NSCursor.unhide() }
-        NSCursor.hide()
-        cursorHidden = true
-        window.invalidateCursorRects(for: window.contentView!)
+        switch presentation {
+        case .kiosk:
+            NSApp.presentationOptions = [.hideDock, .hideMenuBar]
+            boothHost?.hidesCursor = !panelVisible
+            if panelVisible {
+                setCursorHidden(false)
+            } else {
+                // Unhide + hide: macOS can show the cursor again after activation.
+                setCursorHidden(false)
+                setCursorHidden(true)
+            }
+        case .twoScreen:
+            // The laptop stays usable: Dock and menu bar remain.
+            NSApp.presentationOptions = []
+            boothHost?.hidesCursor = true
+            updatePointerCursor()
+        case .windowed:
+            break
+        }
+        if let v = window.contentView { window.invalidateCursorRects(for: v) }
     }
+
+    /// Balanced hide/unhide (NSCursor keeps a count).
+    private func setCursorHidden(_ hide: Bool) {
+        guard hide != cursorHidden else { return }
+        if hide { NSCursor.hide() } else { NSCursor.unhide() }
+        cursorHidden = hide
+    }
+
+    /// Two-screen: the cursor is hidden only while it's over the TV.
+    private func updatePointerCursor() {
+        guard presentation == .twoScreen, let layout else { return }
+        let frame = Self.screen(layout.booth)?.frame ?? layout.booth.frame
+        setCursorHidden(NSMouseInRect(NSEvent.mouseLocation, frame, false))
+    }
+
+    /// Mouse-moved monitors: global (pointer over other apps' windows) and local (ours).
+    private func installPointerMonitors() {
+        guard pointerMonitors.isEmpty else { return }
+        let mask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
+        if let g = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] _ in
+            MainActor.assumeIsolated { self?.updatePointerCursor() }
+        }) {
+            pointerMonitors.append(g)
+        }
+        if let l = NSEvent.addLocalMonitorForEvents(matching: mask, handler: { [weak self] event in
+            MainActor.assumeIsolated { self?.updatePointerCursor() }
+            return event
+        }) {
+            pointerMonitors.append(l)
+        }
+    }
+
+    // MARK: Menu
 
     private func makeMainMenu() -> NSMenu {
         let main = NSMenu()
         let appItem = NSMenuItem()
         main.addItem(appItem)
         let appMenu = NSMenu()
+        if !options.learnKey {
+            let panel = NSMenuItem(title: "Control Panel…", action: #selector(showControlPanel(_:)), keyEquivalent: ",")
+            panel.target = self
+            appMenu.addItem(panel)
+            appMenu.addItem(.separator())
+        }
         appMenu.addItem(withTitle: "Quit PhotoBooth", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
+
+        // Standard editing commands for the control panel's text fields.
+        let editItem = NSMenuItem()
+        main.addItem(editItem)
+        let edit = NSMenu(title: "Edit")
+        edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        let redo = edit.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "z")
+        redo.keyEquivalentModifierMask = [.command, .shift]
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = edit
+
+        let windowItem = NSMenuItem()
+        main.addItem(windowItem)
+        let win = NSMenu(title: "Window")
+        win.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        win.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        windowItem.submenu = win
         return main
     }
 }

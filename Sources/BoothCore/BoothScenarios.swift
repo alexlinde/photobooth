@@ -25,6 +25,9 @@ public enum BoothScenarios {
         ("local photo sink naming / collisions", localSinkNaming),
         ("config parsing and defaults", configParsing),
         ("key name mapping", keyMapping),
+        ("pause / resume (countdown aborted, capture in flight saved)", pauseResume),
+        ("lighting profiles in config", lightingProfiles),
+        ("screen layout (booth / control panel displays)", screenLayout),
     ]
 
     /// Runs everything; prints results; returns true when all pass.
@@ -385,6 +388,260 @@ public enum BoothScenarios {
         try check(s.eventFolderName == "a-b-c", "folder \(s.eventFolderName)")
         s.eventName = "  "
         try check(s.eventFolderName == "PhotoBooth", "empty folder name")
+    }
+
+    static func pauseResume() async throws {
+        let h = Harness()
+        try await h.startReady()
+        // From idle.
+        h.controller.pause()
+        await h.pump()
+        try check(h.label == "paused" && h.controller.isPaused, "pause from idle: \(h.label)")
+        try h.press(expect: .ignored("paused"))
+        h.controller.resume()
+        await h.pump()
+        try check(h.label == "idle" && !h.controller.isPaused, "resume: \(h.label)")
+        // During the countdown: aborted, half-press released, no capture.
+        await h.advance(1)
+        try h.press(expect: .accepted)
+        await h.advance(1.2)
+        try check(h.label.hasPrefix("countdown"), "expected countdown, got \(h.label)")
+        h.controller.pause()
+        await h.pump()
+        try check(h.label == "paused", "pause in countdown: \(h.label)")
+        try check(h.camera.cancelPrepareCount == 1, "cancelPrepare \(h.camera.cancelPrepareCount)x")
+        await h.advance(10)
+        try check(h.label == "paused" && h.camera.captureCount == 0, "aborted session resumed: \(h.label), \(h.camera.captureCount) captures")
+        try h.press(expect: .ignored("paused"))
+        // Camera comings and goings don't leave the paused screen.
+        h.camera.setState(.searching)
+        await h.pump()
+        try check(h.label == "paused", "camera lost while paused: \(h.label)")
+        h.camera.setState(.ready(name: "Fake"))
+        await h.pump()
+        try check(h.label == "paused", "camera back while paused: \(h.label)")
+        // Attendant issues raised while paused wait, and show on resume.
+        h.controller.raiseAttendant(.other("lights"))
+        await h.pump()
+        try check(h.label == "paused" && h.controller.attendantIssue == .other("lights"), "attendant while paused: \(h.label)")
+        h.controller.resume()
+        await h.pump()
+        try check(h.label == "attendant(other)", "resume with issue: \(h.label)")
+        h.controller.attendantReset()
+        await h.pump()
+        try check(h.label == "idle" && h.controller.attendantIssue == nil, "reset: \(h.label)")
+        // Reset while paused clears a waiting issue.
+        h.controller.raiseAttendant(.other("x"))
+        h.controller.pause()
+        h.controller.attendantReset()
+        await h.pump()
+        try check(h.label == "paused" && h.controller.attendantIssue == nil, "reset while paused: \(h.label)")
+        h.controller.resume()
+        await h.pump()
+        try check(h.label == "idle", "resume after reset: \(h.label)")
+        // During capture: the photo in flight is saved, then paused (no review).
+        await h.advance(1)
+        try h.press(expect: .accepted)
+        try await h.step(until: "capturing(1/1)")
+        h.controller.pause()
+        try check(h.label == "capturing(1/1)", "capture must finish: \(h.label)")
+        try await h.step(until: "paused", within: 2)
+        try check(h.sink.storedCount == 1 && h.camera.captureCount == 1, "stored \(h.sink.storedCount)")
+        try check(!h.history.contains("review(1/1)"), "review shown while paused: \(h.history)")
+        // During review: back to paused straight away.
+        h.controller.resume()
+        await h.advance(1)
+        try h.press(expect: .accepted)
+        try await h.step(until: "review(1/1)")
+        h.controller.pause()
+        await h.pump()
+        try check(h.label == "paused" && h.sink.storedCount == 2, "pause in review: \(h.label)")
+        h.controller.resume()
+        await h.advance(10)
+        try check(h.label == "idle" && h.camera.captureCount == 2, "after resume: \(h.label)")
+    }
+
+    static func lightingProfiles() async throws {
+        // Defaults: strobes, no overrides, and no "profiles" key written.
+        let d = BoothConfig()
+        try check(d.lighting == .strobes && d.cameraProfile == .strobes, "default profile \(String(describing: d.cameraProfile))")
+        let json = String(decoding: d.encodedJSON(), as: UTF8.self)
+        try check(json.contains("\"lighting\" : \"strobes\"") && !json.contains("profiles"), "default JSON: \(json)")
+        // "none" leaves the camera alone.
+        let (n, e0) = ConfigLoader.decode(Data(#"{"lighting": "none"}"#.utf8))
+        try check(e0 == nil && n.lighting == .none && n.cameraProfile == nil, "none: \(String(describing: e0))")
+        // Partial overrides merge onto the built-ins.
+        let partial = """
+        {"lighting": "Strobes", "profiles": {
+          "strobes": {"shutter": "1/125", "aperture": 5.6, "iso": 200, "flashCompensation": -0.3, "settingEffect": true},
+          "ambient": {"aperture": 4, "iso": "auto", "exposureMode": "program", "shutter": "0.5"}}}
+        """
+        let (c, e1) = ConfigLoader.decode(Data(partial.utf8))
+        try check(e1 == nil, "partial: \(String(describing: e1))")
+        var want = CameraProfile.strobes
+        want.shutterSpeed = .init(1, 125)
+        want.aperture = 5.6
+        want.iso = .value(200)
+        want.flashCompensation = -0.3
+        want.liveViewSettingEffect = true
+        try check(c.cameraProfile == want, "strobes merge: \(String(describing: c.cameraProfile))")
+        try check(c.cameraProfile?.flashMode == .fill && c.cameraProfile?.exposureMode == .manual, "untouched fields kept")
+        var amb = c
+        amb.lighting = .ambient
+        try check(amb.cameraProfile?.aperture == 4 && amb.cameraProfile?.iso == .auto && amb.cameraProfile?.exposureMode == .program
+                  && amb.cameraProfile?.shutterSpeed == .init(5, 10)
+                  && amb.cameraProfile?.flashMode == CameraProfile.ambient.flashMode, "ambient merge: \(String(describing: amb.cameraProfile))")
+        // Every friendly spelling of every field.
+        let all = """
+        {"profiles": {"strobes": {"exposureMode": "shutter", "shutter": "2", "aperture": 22, "iso": 12800,
+          "exposureCompensation": 1.7, "flash": "rearSync", "flashCompensation": 3, "focus": "MF",
+          "whiteBalance": "tungsten", "settingEffect": false}}}
+        """
+        let (a, e2) = ConfigLoader.decode(Data(all.utf8))
+        let o = a.profiles.strobes
+        try check(e2 == nil && o.exposureMode == .shutterPriority && o.shutter == .init(2, 1) && o.aperture == 22
+                  && o.iso == .value(12800) && o.exposureCompensation == 1.7 && o.flash == .rearSync && o.flashCompensation == 3
+                  && o.focus == .manual && o.whiteBalance == .tungsten && o.settingEffect == false, "all fields: \(o) \(String(describing: e2))")
+        for (spelling, expected) in [("af-s", CameraProfile.FocusMode.single), ("af-c", .continuous), ("af-a", .automatic), ("dmf", .directManual)] {
+            let (f, e) = ConfigLoader.decode(Data(#"{"profiles": {"ambient": {"focus": "\#(spelling)"}}}"#.utf8))
+            try check(e == nil && f.profiles.ambient.focus == expected, "focus \(spelling)")
+        }
+        for (spelling, expected) in [("1/4000", CameraProfile.ShutterSpeed(1, 4000)), ("30", .init(30, 1)), ("2.5", .init(25, 10)), ("1", .init(1, 1)), ("2s", .init(2, 1)), ("1/160s", .init(1, 160))] {
+            let (f, e) = ConfigLoader.decode(Data(#"{"profiles": {"ambient": {"shutter": "\#(spelling)"}}}"#.utf8))
+            try check(e == nil && f.profiles.ambient.shutter == expected, "shutter \(spelling): \(String(describing: f.profiles.ambient.shutter)) \(String(describing: e))")
+        }
+        // Round trip through save/load, keeping overrides and readable values.
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("photobooth-cfg-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("config.json").path
+        var saved = a
+        saved.lighting = .ambient
+        saved.profiles.ambient = c.profiles.ambient
+        saved.buttonDevice = nil
+        saved.eventName = "Anna's 40th"
+        try ConfigLoader.save(saved, path: path)
+        let (loaded, e3) = ConfigLoader.load(path: path)
+        try check(e3 == nil && loaded == saved, "round trip: \(String(describing: e3))\n\(loaded)\n\(saved)")
+        let text = try String(contentsOfFile: path, encoding: .utf8)
+        for frag in [#""shutter" : "0.5""#, #""iso" : "auto""#, #""iso" : 12800"#, #""focus" : "mf""#, #""settingEffect" : false"#,
+                     #""flash" : "rearSync""#, #""exposureMode" : "program""#, #""buttonDevice" : null"#] {
+            try check(text.contains(frag), "saved JSON lacks \(frag):\n\(text)")
+        }
+        // Saving invalid settings throws and leaves the file alone.
+        var invalid = saved
+        invalid.countdownSeconds = 99
+        do {
+            try ConfigLoader.save(invalid, path: path)
+            throw Failure(description: "saving countdownSeconds 99 should fail")
+        } catch let e as ConfigError {
+            try check(e.problems.contains { $0.contains("countdownSeconds") }, "error \(e)")
+        }
+        try check(ConfigLoader.load(path: path).0 == saved, "invalid save changed the file")
+        // Every invalid value path → ConfigError naming the key, defaults returned.
+        let bad: [(String, String)] = [
+            (#"{"lighting": "strobe"}"#, "lighting"),
+            (#"{"lighting": 1}"#, "lighting"),
+            (#"{"profiles": []}"#, "profiles"),
+            (#"{"profiles": {"strobes": 3}}"#, "profiles.strobes"),
+            (#"{"profiles": {"strobes": {"exposureMode": "auto"}}}"#, "exposureMode"),
+            (#"{"profiles": {"strobes": {"shutter": "fast"}}}"#, "shutter"),
+            (#"{"profiles": {"strobes": {"shutter": "1/0"}}}"#, "shutter"),
+            (#"{"profiles": {"strobes": {"shutter": "60"}}}"#, "shutter"),
+            (#"{"profiles": {"strobes": {"shutter": "1/16000"}}}"#, "shutter"),
+            (#"{"profiles": {"strobes": {"shutter": true}}}"#, "shutter"),
+            (#"{"profiles": {"strobes": {"aperture": "f/8"}}}"#, "aperture"),
+            (#"{"profiles": {"strobes": {"aperture": 0.5}}}"#, "aperture"),
+            (#"{"profiles": {"strobes": {"iso": "high"}}}"#, "iso"),
+            (#"{"profiles": {"strobes": {"iso": 100.5}}}"#, "iso"),
+            (#"{"profiles": {"strobes": {"iso": 10}}}"#, "iso"),
+            (#"{"profiles": {"ambient": {"exposureCompensation": 9}}}"#, "exposureCompensation"),
+            (#"{"profiles": {"ambient": {"exposureCompensation": "+1"}}}"#, "exposureCompensation"),
+            (#"{"profiles": {"strobes": {"flash": "on"}}}"#, "flash"),
+            (#"{"profiles": {"strobes": {"flashCompensation": -4}}}"#, "flashCompensation"),
+            (#"{"profiles": {"strobes": {"focus": "af"}}}"#, "focus"),
+            (#"{"profiles": {"strobes": {"whiteBalance": "fluorescent"}}}"#, "whiteBalance"),
+            (#"{"profiles": {"strobes": {"settingEffect": "off"}}}"#, "settingEffect"),
+        ]
+        for (b, key) in bad {
+            let (cfg, err) = ConfigLoader.decode(Data(b.utf8))
+            try check(err != nil, "expected error for \(b)")
+            try check(err?.description.contains(key) == true, "error for \(b) doesn't name \(key): \(String(describing: err))")
+            try check(cfg == BoothConfig(), "error should fall back to defaults")
+        }
+        // Unknown keys (top level and inside profiles) are ignored, not errors.
+        let (u, e4) = ConfigLoader.decode(Data(#"{"profiles": {"party": {}, "strobes": {"shuter": "1/60"}}}"#.utf8))
+        try check(e4 == nil && u.profiles.isEmpty, "unknown profile keys: \(String(describing: e4))")
+        // The control panel's choices all parse, and the built-ins' values are among them.
+        for field in ProfileField.allCases {
+            for v in field.choices {
+                var o = ProfileOverride()
+                try field.set(v, in: &o)
+                try check(field.value(in: o) == v, "\(field) choice \(v) → \(String(describing: field.value(in: o)))")
+            }
+            for p in [CameraProfile.strobes, .ambient] {
+                if let v = field.value(in: p) { try check(field.choices.contains(v), "\(p.name) \(field) \(v) not a choice") }
+            }
+        }
+        try check(ProfileField.shutter.choices.first == "1/4000" && ProfileField.shutter.choices.last == "30", "shutter range")
+        try check(ProfileField.aperture.choices.first == "1.8" && ProfileField.aperture.choices.last == "22", "aperture range")
+        try check(ProfileField.iso.choices.prefix(2) == ["auto", "100"] && ProfileField.iso.choices.last == "12800", "iso range")
+        try check(ProfileField.exposureCompensation.choices.contains("-0.3") && ProfileField.exposureCompensation.choices.contains("2.7")
+                  && ProfileField.exposureCompensation.choices.count == 19, "EV steps \(ProfileField.exposureCompensation.choices)")
+    }
+
+    static func screenLayout() async throws {
+        func screen(_ id: UInt32, _ name: String, builtin: Bool = false, main: Bool = false, x: CGFloat = 0) -> ScreenDescriptor {
+            ScreenDescriptor(id: id, name: name, frame: CGRect(x: x, y: 0, width: 1920, height: 1080), isBuiltin: builtin, isMain: main)
+        }
+        let laptop = screen(1, "Built-in Retina Display", builtin: true, main: true)
+        let tv = screen(2, "SONY TV", x: 1920)
+        let monitor = screen(3, "LG UltraFine", x: -1920)
+
+        // Nothing attached (shouldn't happen) → nil.
+        try check(ScreenLayout.compute(screens: [], selection: .auto) == nil, "no screens")
+        // Laptop only → kiosk on it.
+        try check(ScreenLayout.compute(screens: [laptop], selection: .auto) == .singleScreen(booth: laptop), "laptop only")
+        // Laptop + TV → booth on the TV, panel on the laptop (either way round in the list).
+        try check(ScreenLayout.compute(screens: [laptop, tv], selection: .auto) == .twoScreen(booth: tv, panel: laptop), "laptop + TV")
+        var tvMain = tv
+        tvMain.isMain = true
+        var laptopSecond = laptop
+        laptopSecond.isMain = false
+        try check(ScreenLayout.compute(screens: [tvMain, laptopSecond], selection: .auto) == .twoScreen(booth: tvMain, panel: laptopSecond),
+                  "TV as main display")
+        // Lid closed: TV only → kiosk on the TV.
+        try check(ScreenLayout.compute(screens: [tvMain], selection: .auto) == .singleScreen(booth: tvMain), "TV only")
+        // Mac mini: monitor (main) + TV → booth on the non-main external, panel on the monitor.
+        var monitorMain = monitor
+        monitorMain.isMain = true
+        try check(ScreenLayout.compute(screens: [monitorMain, tv], selection: .auto) == .twoScreen(booth: tv, panel: monitorMain), "two externals")
+        // Laptop + monitor + TV, by name: booth on the TV, panel prefers the built-in.
+        try check(ScreenLayout.compute(screens: [laptop, monitor, tv], selection: .name("sony")) == .twoScreen(booth: tv, panel: laptop),
+                  "name selection")
+        try check(ScreenLayout.compute(screens: [laptop, monitor, tv], selection: .name("lg")) == .twoScreen(booth: monitor, panel: laptop),
+                  "name selection 2")
+        // By index (NSScreen order).
+        try check(ScreenLayout.compute(screens: [laptop, tv], selection: .index(1)) == .twoScreen(booth: tv, panel: laptop), "index 1")
+        try check(ScreenLayout.compute(screens: [laptop, tv], selection: .index(0)) == .twoScreen(booth: laptop, panel: tv), "index 0")
+        try check(ScreenLayout.compute(screens: [laptop, tv], selection: .main) == .twoScreen(booth: laptop, panel: tv), "main")
+        // A selection that matches nothing falls back to the first display.
+        try check(ScreenLayout.compute(screens: [laptop, tv], selection: .index(5)) == .twoScreen(booth: laptop, panel: tv), "bad index")
+        try check(ScreenLayout.compute(screens: [laptop], selection: .name("SONY")) == .singleScreen(booth: laptop), "missing TV by name")
+        // The panel is never on the booth display, whatever the selection.
+        let sets: [[ScreenDescriptor]] = [[laptop], [laptop, tv], [tvMain, laptopSecond], [monitorMain, tv], [laptop, monitor, tv], [tvMain]]
+        let selections: [BoothConfig.DisplaySelection] = [.auto, .main, .index(0), .index(1), .index(2), .index(9), .name("sony"), .name("lg"), .name("built-in"), .name("none")]
+        for screens in sets {
+            for sel in selections {
+                guard let l = ScreenLayout.compute(screens: screens, selection: sel) else { throw Failure(description: "nil layout") }
+                try check(screens.contains(l.booth), "booth on unknown screen")
+                if let p = l.panel {
+                    try check(p.id != l.booth.id, "panel on booth display: \(screens) \(sel)")
+                    try check(screens.count > 1, "two-screen layout with one screen")
+                } else {
+                    try check(screens.count == 1, "single-screen layout with \(screens.count) screens")
+                }
+            }
+        }
     }
 
     static func keyMapping() async throws {

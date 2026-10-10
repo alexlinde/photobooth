@@ -116,6 +116,23 @@ struct UploadQueueTests {
         await q.stop()
     }
 
+    @Test func retryNowSkipsBackoff() async throws {
+        let dir = tempDir()
+        let f = makeJPEG(in: dir, name: "a.jpg")
+        let clock = StuckClock()
+        let up = ScriptedUploader([.failure(.notAuthorized)])
+        let q = UploadQueue(stateURL: dir.appendingPathComponent("q.json"), uploader: up,
+                            clock: clock, backoff: noJitter, pathMonitor: nil)
+        await q.enqueue(f)
+        await q.start()
+        #expect(await waitUntil { await q.snapshot().lastError == "Google Photos sign-in required" })
+        try await Task.sleep(nanoseconds: 50_000_000)
+        #expect(await q.snapshot().uploaded == 0)  // waiting out the 5-minute backoff
+        await q.retryNow()
+        #expect(await waitUntil { await q.snapshot().uploaded == 1 })
+        await q.stop()
+    }
+
     @Test func inFlightResetOnStart() async throws {
         let dir = tempDir()
         let f = makeJPEG(in: dir, name: "a.jpg")

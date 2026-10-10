@@ -83,6 +83,8 @@ public enum BoothState: Equatable {
     /// Brief friendly message (e.g. after a failed capture), then back to idle.
     case notice(String)
     case attendant(AttendantIssue)
+    /// Paused by the attendant (control panel): "Back in a moment", presses ignored.
+    case paused
 
     /// Compact label for logs and the self-test.
     public var label: String {
@@ -95,6 +97,7 @@ public enum BoothState: Equatable {
         case let .betweenShots(k, n): return "between(\(k)/\(n))"
         case .notice: return "notice"
         case .attendant(let i): return "attendant(\(i.kind))"
+        case .paused: return "paused"
         }
     }
 }
@@ -119,6 +122,9 @@ public final class BoothController {
     public var inputBanner: String?
     /// Set when the configured button device is missing (HID device filter).
     public var buttonStatus: String?
+    /// Paused from the control panel. While paused the state is `.paused` (except while a
+    /// capture already in flight finishes and saves).
+    public private(set) var isPaused = false
 
     @ObservationIgnored public var settings: BoothSettings
     @ObservationIgnored public var sink: PhotoSink
@@ -199,8 +205,60 @@ public final class BoothController {
         return .accepted
     }
 
+    /// Pause the booth (control panel). A countdown or review in progress is aborted cleanly
+    /// (half-press released); a capture already in flight is saved first. Attendant issues
+    /// raised while paused wait in `attendantIssue` and show on resume.
+    public func pause() {
+        guard !isPaused else { return }
+        isPaused = true
+        BoothLog.info(.booth, "Booth paused (state \(state.label))")
+        switch state {
+        case .capturing:
+            break // runSession saves the photo, then lands on .paused via returnToIdle().
+        case .countdown, .betweenShots, .review, .notice:
+            abortSession()
+            set(.paused)
+        case .attendant(let issue):
+            storageRetryTask?.cancel()
+            pendingAttendant = issue
+            set(.paused)
+        case .idle, .waitingForCamera:
+            set(.paused)
+        case .paused:
+            break
+        }
+    }
+
+    public func resume() {
+        guard isPaused else { return }
+        isPaused = false
+        BoothLog.info(.booth, "Booth resumed")
+        if case .paused = state { returnToIdle() }
+    }
+
+    /// The issue on the attendant screen, or one waiting to be shown (deferred mid-session,
+    /// or raised while paused). For the control panel.
+    public var attendantIssue: AttendantIssue? {
+        if case .attendant(let i) = state { return i }
+        return pendingAttendant
+    }
+
     /// Attendant key: retry/clear the current attendant issue.
     public func attendantReset() {
+        if case .paused = state, let issue = pendingAttendant {
+            // Paused with an issue waiting: clear it (storage first retries its unsaved photos).
+            BoothLog.info(.booth, "Attendant reset while paused (\(issue.kind))")
+            if case .storage = issue {
+                Task {
+                    await self.retryUnsaved()
+                    if self.unsavedPhotos.isEmpty, case .storage = self.pendingAttendant { self.pendingAttendant = nil }
+                }
+            } else {
+                consecutiveFailures = 0
+                pendingAttendant = nil
+            }
+            return
+        }
         guard case .attendant(let issue) = state else { return }
         BoothLog.info(.booth, "Attendant reset (\(issue.kind))")
         switch issue {
@@ -224,7 +282,7 @@ public final class BoothController {
             enterAttendant(issue)
         }
     }
-    @ObservationIgnored private var pendingAttendant: AttendantIssue?
+    private var pendingAttendant: AttendantIssue?
 
     /// Clears an attendant issue of the given kind when its cause has resolved.
     public func resolveAttendant(kind: String) {
@@ -262,6 +320,8 @@ public final class BoothController {
                 consecutiveFailures = 0
                 returnToIdle()
             }
+        case .paused:
+            break // resume() picks idle or waiting from the camera state at that point.
         }
     }
 
@@ -340,6 +400,12 @@ public final class BoothController {
                 }
                 savedURLs.append(url)
                 BoothLog.info(.storage, "Saved \(url.path)")
+                if isPaused {
+                    // Paused while this shot was in flight: it's saved; skip review and the rest.
+                    decodeTask.cancel()
+                    returnToIdle()
+                    return
+                }
                 let image = await decodeTask.value
                 guard id == sessionID else { return }
                 set(.review(ReviewPhoto(url: url, image: image), shot: shot, of: n))
@@ -357,6 +423,10 @@ public final class BoothController {
         let cameraOK = camera.state.isReady
         if cameraOK { consecutiveFailures += 1 }
         BoothLog.error(.camera, "Capture failed (\(consecutiveFailures) in a row, camera \(camera.state)): \(error)")
+        if isPaused, consecutiveFailures < settings.maxConsecutiveFailures {
+            returnToIdle()
+            return
+        }
         if consecutiveFailures >= settings.maxConsecutiveFailures {
             enterAttendant(.captureFailures("\(consecutiveFailures) photos in a row failed. Last error: \(Self.describe(error)). Check the camera (battery, memory card, lens cap, settings)."))
             return
@@ -371,6 +441,12 @@ public final class BoothController {
 
     private func enterAttendant(_ issue: AttendantIssue) {
         BoothLog.error(.booth, "Attendant needed: \(issue.title) — \(issue.detail)")
+        if isPaused {
+            // Stays on "Back in a moment"; the panel shows the issue and resume() raises it.
+            pendingAttendant = issue
+            set(.paused)
+            return
+        }
         cameraDroppedSinceAttendant = false
         set(.attendant(issue))
         if case .storage = issue { scheduleStorageRetry() }
@@ -414,6 +490,10 @@ public final class BoothController {
     }
 
     private func returnToIdle() {
+        if isPaused {
+            set(.paused)
+            return
+        }
         if let issue = pendingAttendant {
             pendingAttendant = nil
             enterAttendant(issue)

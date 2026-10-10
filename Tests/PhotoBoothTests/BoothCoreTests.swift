@@ -17,6 +17,9 @@ final class BoothCoreTests: XCTestCase {
     func testLocalSinkNaming() async throws { try await BoothScenarios.localSinkNaming() }
     func testConfigParsing() async throws { try await BoothScenarios.configParsing() }
     func testKeyMapping() async throws { try await BoothScenarios.keyMapping() }
+    func testPauseResume() async throws { try await BoothScenarios.pauseResume() }
+    func testLightingProfiles() async throws { try await BoothScenarios.lightingProfiles() }
+    func testScreenLayout() async throws { try await BoothScenarios.screenLayout() }
 
     func testDefaultConfigJSONIsStable() throws {
         let json = String(decoding: BoothConfig().encodedJSON(), as: UTF8.self)

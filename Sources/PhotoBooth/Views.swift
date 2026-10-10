@@ -117,6 +117,8 @@ struct BoothRootView: View {
             WaitingView(status: status, h: h)
         case let .attendant(issue):
             AttendantView(issue: issue, h: h)
+        case .paused:
+            PausedView(h: h)
         }
     }
 }
@@ -241,6 +243,29 @@ struct MessageView: View {
                 .multilineTextAlignment(.center)
                 .shadow(color: .black.opacity(0.7), radius: 12)
                 .padding(h * 0.06)
+        }
+    }
+}
+
+/// Shown while the attendant has paused the booth from the control panel.
+struct PausedView: View {
+    let h: CGFloat
+    var body: some View {
+        ZStack {
+            LinearGradient(colors: [Color(red: 0.1, green: 0.1, blue: 0.16), .black], startPoint: .top, endPoint: .bottom)
+            VStack(spacing: h * 0.035) {
+                Image(systemName: "cup.and.saucer.fill")
+                    .font(.system(size: h * 0.12))
+                    .foregroundStyle(.white.opacity(0.85))
+                Text("Back in a moment")
+                    .font(.booth(h * 0.1))
+                    .foregroundStyle(.white)
+                Text("The photo booth is taking a short break.")
+                    .font(.booth(h * 0.035, .medium))
+                    .foregroundStyle(.white.opacity(0.6))
+            }
+            .multilineTextAlignment(.center)
+            .padding(h * 0.06)
         }
     }
 }

@@ -10,10 +10,17 @@ import IOKit.hid
 ///   switches back once it is.
 /// - `local` mode: `NSEvent` local monitor (app must be focused). The device filter cannot
 ///   apply in this mode.
+/// - Seizing: in `hid` mode with a device filter, the device is opened with
+///   `kIOHIDOptionsTypeSeizeDevice`, so its keystrokes reach only us, not the focused app
+///   (e.g. the control panel's text fields). Never without a filter (that would swallow every
+///   keyboard) and never in learn mode. If seizing fails we open normally and say so in
+///   `Status`. A seized device's keys never reach the NSEvent path, so it can't double-trigger;
+///   unseized, the local path ignores the button key while in `hid` mode.
 ///
 /// A local monitor is always installed for the attendant shortcuts (Ctrl+Opt+Cmd+Q quit,
 /// Ctrl+Opt+Cmd+R reset/reload, Ctrl+Opt+Cmd+D fake-camera disconnect) and to swallow plain
-/// key presses so the kiosk window doesn't beep.
+/// key presses so the kiosk window doesn't beep. Keys aimed at other windows (the control
+/// panel; see `isBoothEvent`) pass through.
 @MainActor
 final class ButtonInput {
     struct DeviceInfo: Equatable, CustomStringConvertible {
@@ -53,12 +60,19 @@ final class ButtonInput {
         /// nil when there's no device filter (or not in HID mode).
         var deviceConnected: Bool?
         var deviceDescription: String?
+        /// HID with a device filter: whether the device was opened exclusively. nil otherwise.
+        var seized: Bool?
+        /// Why seizing failed (IOReturn code), when it did.
+        var seizeFailure: String?
     }
 
     var onPress: (() -> Void)?
     var onRaw: ((RawPress) -> Void)?
     var onShortcut: ((Shortcut) -> Void)?
     var onStatusChange: ((Status) -> Void)?
+    /// True for key events aimed at the booth window (or no window). Others (the control
+    /// panel) get their keys, apart from the attendant shortcuts.
+    var isBoothEvent: (NSEvent) -> Bool = { _ in true }
 
     private(set) var status: Status
     private var key: KeySpec?
@@ -69,6 +83,8 @@ final class ButtonInput {
 
     private var manager: IOHIDManager?
     private var matchedDevices = 0
+    private var seized: Bool?
+    private var seizeFailure: String?
     private var localMonitor: Any?
     private var permissionTimer: Timer?
 
@@ -153,7 +169,7 @@ final class ButtonInput {
     private func hidStatus() -> Status {
         Status(mode: .hid, fallbackReason: nil,
                deviceConnected: deviceFilter == nil ? nil : matchedDevices > 0,
-               deviceDescription: deviceFilter?.hexDescription)
+               deviceDescription: deviceFilter?.hexDescription, seized: seized, seizeFailure: seizeFailure)
     }
 
     private func setStatus(_ s: Status) {
@@ -164,10 +180,9 @@ final class ButtonInput {
 
     // MARK: HID
 
-    private func openHID() -> Bool {
-        let m = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
-        var matches: [[String: Any]] = []
-        for usage in [kHIDUsage_GD_Keyboard, kHIDUsage_GD_Keypad] {
+    /// Matching only ever covers the configured device when there's a filter.
+    private func matchingDictionaries() -> [[String: Any]] {
+        [kHIDUsage_GD_Keyboard, kHIDUsage_GD_Keypad].map { usage in
             var d: [String: Any] = [
                 kIOHIDDeviceUsagePageKey: kHIDPage_GenericDesktop,
                 kIOHIDDeviceUsageKey: usage,
@@ -176,8 +191,12 @@ final class ButtonInput {
                 d[kIOHIDVendorIDKey] = f.vendorID
                 d[kIOHIDProductIDKey] = f.productID
             }
-            matches.append(d)
+            return d
         }
+    }
+
+    private func makeManager(_ matches: [[String: Any]]) -> IOHIDManager {
+        let m = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
         IOHIDManagerSetDeviceMatchingMultiple(m, matches as CFArray)
         let ctx = Unmanaged.passUnretained(self).toOpaque()
         IOHIDManagerRegisterDeviceMatchingCallback(m, { ctx, _, _, device in
@@ -196,10 +215,46 @@ final class ButtonInput {
             MainActor.assumeIsolated { me.hidValue(value) }
         }, ctx)
         IOHIDManagerScheduleWithRunLoop(m, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+        return m
+    }
+
+    private func discard(_ m: IOHIDManager) {
+        IOHIDManagerUnscheduleFromRunLoop(m, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+        IOHIDManagerClose(m, IOOptionBits(kIOHIDOptionsTypeNone))
+    }
+
+    private func openHID() -> Bool {
+        let matches = matchingDictionaries()
+        // Seize only when every matching dictionary pins the vendor and product ID, i.e. the
+        // manager can only ever match the button, never the laptop keyboard.
+        let filtered = !matches.isEmpty && matches.allSatisfy { $0[kIOHIDVendorIDKey] != nil && $0[kIOHIDProductIDKey] != nil }
+        let seize = deviceFilter != nil && !learn && filtered
+        seized = nil
+        seizeFailure = nil
+        matchedDevices = 0
+        if seize {
+            let m = makeManager(matches)
+            let rc = IOHIDManagerOpen(m, IOOptionBits(kIOHIDOptionsTypeSeizeDevice))
+            if rc == kIOReturnSuccess {
+                seized = true
+                BoothLog.info(.input, "IOHIDManagerOpen(seize) → kIOReturnSuccess: button keystrokes go only to PhotoBooth")
+                manager = m
+                return true
+            }
+            // A fresh manager for the plain open: reopening this one wouldn't report the
+            // already-matched devices again.
+            discard(m)
+            seized = false
+            seizeFailure = String(format: "0x%08X", rc) + (rc == kIOReturnNotPrivileged ? " not privileged" : "")
+            BoothLog.error(.input, String(format: "IOHIDManagerOpen(seize) failed: 0x%08X; opening without seizing (the button also types into the focused app)", rc))
+        }
+        let m = makeManager(matches)
         let rc = IOHIDManagerOpen(m, IOOptionBits(kIOHIDOptionsTypeNone))
         guard rc == kIOReturnSuccess else {
             BoothLog.error(.input, String(format: "IOHIDManagerOpen failed: 0x%08X", rc))
-            IOHIDManagerUnscheduleFromRunLoop(m, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+            discard(m)
+            seized = nil
+            seizeFailure = nil
             return false
         }
         manager = m
@@ -212,6 +267,8 @@ final class ButtonInput {
         IOHIDManagerClose(m, IOOptionBits(kIOHIDOptionsTypeNone))
         manager = nil
         matchedDevices = 0
+        seized = nil
+        seizeFailure = nil
     }
 
     private func deviceChanged(_ device: IOHIDDevice, added: Bool) {
@@ -265,8 +322,19 @@ final class ButtonInput {
             default: break
             }
         }
-        // Let Cmd-key equivalents (Cmd+Q) through to the menu.
+        // Let Cmd-key equivalents (Cmd+Q, Cmd+,) through to the menu.
         if mods.contains(.command) { return event }
+        if !learn, !isBoothEvent(event) {
+            // The control panel has focus: typing goes to it. In focused-window fallback the
+            // button key still counts, unless a text field is being edited.
+            let editing = event.window?.firstResponder is NSText
+            if status.mode == .local, !editing, !event.isARepeat, let kc = key?.keyCode, event.keyCode == kc,
+               mods.intersection([.control, .option]).isEmpty {
+                onPress?()
+                return nil
+            }
+            return event
+        }
         if learn {
             if !event.isARepeat {
                 onRaw?(RawPress(source: .nsevent, hidUsage: nil, keyCode: event.keyCode, characters: event.charactersIgnoringModifiers, device: nil))
