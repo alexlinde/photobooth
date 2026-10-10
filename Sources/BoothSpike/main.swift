@@ -4,7 +4,8 @@ import PTPKit
 import SonyCamera
 
 // Phase 0 spike: prove the ImageCaptureCore → Sony PTP path end to end.
-//   booth-spike [--frames N] [--no-capture] [--out DIR] [--quiet-liveview]
+//   booth-spike [--frames N] [--no-capture] [--out DIR] [--quiet-liveview] [--set 0xCODE=VALUE ...]
+//   (--set writes a property via SetControlDeviceA after the handshake and reports the read-back.)
 // Phase 1 soak: run SonyBoothCamera for a while, capturing every 20 s.
 //   booth-spike --soak SECONDS [--soak-fault] [--trace]
 
@@ -16,6 +17,7 @@ struct Options {
     var soak: Int?
     var soakFault = false
     var trace = false
+    var sets: [(code: UInt16, value: Int64)] = []
 
     init(_ args: [String]) {
         var it = args.dropFirst().makeIterator()
@@ -28,9 +30,18 @@ struct Options {
             case "--soak": soak = Int(it.next() ?? "") ?? 120
             case "--soak-fault": soakFault = true
             case "--trace": trace = true
+            case "--set":
+                let kv = (it.next() ?? "").split(separator: "=").map(String.init)
+                guard kv.count == 2, let code = Options.int(kv[0]).flatMap({ UInt16(exactly: $0) }),
+                      let value = Options.int(kv[1]) else { print("--set wants 0xCODE=VALUE"); exit(2) }
+                sets.append((code, value))
             default: print("unknown argument \(a)"); exit(2)
             }
         }
+    }
+
+    static func int(_ s: String) -> Int64? {
+        s.hasPrefix("0x") ? Int64(s.dropFirst(2), radix: 16) : Int64(s)
     }
 }
 
@@ -87,6 +98,24 @@ func run() async {
     step("3. Sony PC Remote handshake")
     do { try await session.connect() } catch { fail("handshake", error) }
     say("handshake OK, protocol \(hex16(session.protocolVersion)), \(session.properties.count) properties parsed")
+
+    // 3b. Property writes
+    if !opts.sets.isEmpty {
+        step("3b. Property writes")
+        for (code, value) in opts.sets {
+            guard let p = session.properties[code] else { say("\(hex16(code)): not reported by camera, skipped"); continue }
+            let before = p.currentValue
+            do {
+                let v: PTPValue = value < 0 ? .int(value) : .uint(UInt64(value))
+                try await session.setControlA(code, v, type: p.dataType)
+                try await Task.sleep(for: .milliseconds(700))
+                _ = try await session.refreshProperties()
+                let after = session.properties[code]?.currentValue
+                say("\(hex16(code)) getSet=\(p.getSet) enabled=\(p.isEnabled): \(before) → wrote \(value) → reads \(after.map { "\($0)" } ?? "?")"
+                    + (after?.uint64 == v.uint64 ? "  ✓" : "  ✗ unchanged"))
+            } catch { say("\(hex16(code)): write failed: \(error)") }
+        }
+    }
 
     // 4. Property dump
     step("4. Property dump")

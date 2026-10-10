@@ -89,6 +89,80 @@ public final class FakeBoothCamera: BoothCamera {
         state = s
         updateLiveView()
         for c in stateContinuations.values { c.yield(s) }
+        if s.isReady {
+            applyProfile()
+        } else {
+            profileTask?.cancel()
+            updateStatus { $0.applyingProfile = false; $0.lastReport = nil; $0.readout = nil }
+        }
+    }
+
+    // MARK: Profile (every requested setting "applies"; the readout echoes the profile)
+
+    public private(set) var status = CameraStatus()
+    private var statusContinuations: [UUID: AsyncStream<CameraStatus>.Continuation] = [:]
+    private var profileTask: Task<Void, Never>?
+    /// Profile apply duration (the real camera takes a couple of seconds for a mode change).
+    var profileApplyDelay = 0.3
+
+    public func statusUpdates() -> AsyncStream<CameraStatus> {
+        let id = UUID()
+        let (stream, cont) = AsyncStream<CameraStatus>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        cont.yield(status)
+        statusContinuations[id] = cont
+        cont.onTermination = { _ in Task { @MainActor [weak self] in self?.statusContinuations[id] = nil } }
+        return stream
+    }
+
+    public func setProfile(_ profile: CameraProfile?) {
+        updateStatus { $0.profile = profile }
+        if state.isReady { applyProfile() }
+    }
+
+    private func updateStatus(_ change: (inout CameraStatus) -> Void) {
+        var s = status
+        change(&s)
+        guard s != status else { return }
+        status = s
+        for c in statusContinuations.values { c.yield(s) }
+    }
+
+    private func applyProfile() {
+        profileTask?.cancel()
+        guard let p = status.profile else {
+            updateStatus { $0.lastReport = nil; $0.readout = CameraReadout(batteryPercent: 100) }
+            return
+        }
+        updateStatus { $0.applyingProfile = true }
+        profileTask = Task { [weak self] in
+            guard let self else { return }
+            do { try await self.clock.sleep(seconds: self.profileApplyDelay) } catch { return }
+            let items = Self.describe(p).map { CameraProfileReport.Item(setting: $0.0, requested: $0.1, outcome: .applied) }
+            self.updateStatus {
+                $0.applyingProfile = false
+                $0.lastReport = CameraProfileReport(profileName: p.name, items: items, finishedAt: Date())
+                $0.readout = CameraReadout(
+                    exposureMode: p.exposureMode?.rawValue, shutterSpeed: p.shutterSpeed?.description,
+                    aperture: p.aperture.map { String(format: "f/%g", $0) },
+                    iso: p.iso.map { if case .value(let v) = $0 { return "\(v)" } else { return "Auto" } },
+                    flashMode: p.flashMode?.rawValue, focusMode: p.focusMode?.rawValue, batteryPercent: 100)
+            }
+        }
+    }
+
+    private static func describe(_ p: CameraProfile) -> [(String, String)] {
+        var out: [(String, String)] = []
+        if let v = p.exposureMode { out.append(("Exposure mode", v.rawValue)) }
+        if let v = p.shutterSpeed { out.append(("Shutter speed", v.description)) }
+        if let v = p.aperture { out.append(("Aperture", String(format: "f/%g", v))) }
+        if let v = p.iso { out.append(("ISO", { if case .value(let i) = v { return "\(i)" } else { return "Auto" } }())) }
+        if let v = p.exposureCompensation { out.append(("Exposure compensation", String(format: "%+.1f EV", v))) }
+        if let v = p.flashMode { out.append(("Flash mode", v.rawValue)) }
+        if let v = p.flashCompensation { out.append(("Flash compensation", String(format: "%+.1f EV", v))) }
+        if let v = p.focusMode { out.append(("Focus mode", v.rawValue)) }
+        if let v = p.whiteBalance { out.append(("White balance", v.rawValue)) }
+        if let v = p.liveViewSettingEffect { out.append(("Live view Setting Effect", v ? "On" : "Off")) }
+        return out
     }
 
     private func connect() {

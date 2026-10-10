@@ -48,6 +48,10 @@ public enum BoothCameraError: Error, Sendable, Equatable {
 /// - `capture()` fires the shutter (releasing the half-press) and returns the image. It
 ///   throws `notReady` if not `.ready`, `captureInProgress` if called concurrently.
 /// - `cancelPrepare()` releases a half-press without firing (e.g. countdown aborted).
+/// - `setProfile(_:)` stores the profile; it is applied on every (re)connect and, if the
+///   camera is ready, straight away (after any capture in flight). Results are published
+///   through `status` / `statusUpdates()`. Applying a profile never faults the connection:
+///   settings the camera refuses are reported, not thrown.
 @MainActor
 public protocol BoothCamera: AnyObject {
     var state: CameraConnectionState { get }
@@ -63,4 +67,9 @@ public protocol BoothCamera: AnyObject {
     func prepareCapture() async
     func cancelPrepare() async
     func capture() async throws -> CapturedPhoto
+
+    var status: CameraStatus { get }
+    /// Emits the current status immediately, then every change. Multiple subscribers allowed.
+    func statusUpdates() -> AsyncStream<CameraStatus>
+    func setProfile(_ profile: CameraProfile?)
 }

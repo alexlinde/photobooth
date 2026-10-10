@@ -217,6 +217,18 @@ public final class SonyBoothCamera: BoothCamera {
         }
     }
 
+    // MARK: - Profile (stub: stored and published, not yet applied — see CameraProfile.swift)
+
+    public private(set) var status = CameraStatus()
+    private let statusBroadcaster = Broadcaster<CameraStatus>()
+
+    public func statusUpdates() -> AsyncStream<CameraStatus> { statusBroadcaster.subscribe(initial: status) }
+
+    public func setProfile(_ profile: CameraProfile?) {
+        status.profile = profile
+        statusBroadcaster.yield(status)
+    }
+
     // MARK: - Fault injection
 
     public func simulateFault(_ fault: SimulatedFault) {
