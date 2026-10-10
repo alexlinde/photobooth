@@ -40,8 +40,9 @@ final class ControlPanelModel {
 
     /// Validates + saves + applies; returns the problem, if any.
     @ObservationIgnored var onSave: ((BoothConfig) -> ConfigError?)?
+    /// Opens the print window.
+    @ObservationIgnored var onPrint: (() -> Void)?
     @ObservationIgnored private var tasks: [Task<Void, Never>] = []
-    @ObservationIgnored private var thumbnails: [URL: NSImage] = [:]
     @ObservationIgnored private var photosTask: Task<Void, Never>?
 
     init(controller: BoothController, camera: BoothCamera, config: BoothConfig, configPath: String) {
@@ -72,7 +73,15 @@ final class ControlPanelModel {
         let folderChanged = cfg.eventDirectoryURL != applied.eventDirectoryURL
         applied = cfg
         loadError = nil
-        if clean { draft = cfg }
+        if clean {
+            draft = cfg
+        } else {
+            // The panel doesn't edit the print settings (the print window saves the printer).
+            draft.printer = cfg.printer
+            draft.printMedia = cfg.printMedia
+            draft.printTemplate = cfg.printTemplate
+            draft.printCaption = cfg.printCaption
+        }
         if folderChanged { refreshPhotos() }
     }
 
@@ -114,36 +123,17 @@ final class ControlPanelModel {
 
     // MARK: Recent photos
 
-    /// Reloads the newest photos in the event folder (names are timestamps, so sort by name).
+    /// Reloads the newest photos in the event folder.
     func refreshPhotos() {
         let dir = applied.eventDirectoryURL
-        let cache = thumbnails
         photosTask?.cancel()
         photosTask = Task { [weak self] in
             let loaded = await Task.detached(priority: .utility) { () -> [(URL, CGImage?)] in
-                let files = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil,
-                                                                          options: [.skipsHiddenFiles])) ?? []
-                let newest = files.filter { $0.pathExtension.lowercased() == "jpg" }
-                    .sorted { $0.lastPathComponent > $1.lastPathComponent }
-                    .prefix(8)
-                return newest.map { url in (url, cache[url] == nil ? Self.thumbnail(url) : nil) }
+                ThumbnailCache.eventPhotos(in: dir).prefix(8).map { ($0, ThumbnailCache.shared.thumbnail($0)) }
             }.value
             guard let self, !Task.isCancelled else { return }
-            for (url, img) in loaded {
-                if let img { self.thumbnails[url] = NSImage(cgImage: img, size: .zero) }
-            }
-            self.recent = loaded.map { RecentPhoto(url: $0.0, thumbnail: self.thumbnails[$0.0]) }
+            self.recent = loaded.map { RecentPhoto(url: $0.0, thumbnail: $0.1.map { NSImage(cgImage: $0, size: .zero) }) }
         }
-    }
-
-    nonisolated static func thumbnail(_ url: URL) -> CGImage? {
-        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
-        let opts: [CFString: Any] = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: 360,
-        ]
-        return CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary)
     }
 
     func showFolder() {
@@ -514,6 +504,9 @@ struct ControlPanelView: View {
             HStack {
                 Text("Recent photos")
                 Spacer()
+                Button("Print…") { model.onPrint?() }
+                    .controlSize(.small)
+                    .help("Print a photo strip (⌘P)")
                 Button("Show folder") { model.showFolder() }
                     .controlSize(.small)
             }
@@ -573,6 +566,43 @@ struct ControlPanelView: View {
             }
         }
         .padding(12)
+    }
+}
+
+/// Event-folder photo thumbnails, shared by the control panel and the print window. Thread-safe;
+/// least-recently-used ones are dropped past `countLimit`.
+final class ThumbnailCache: @unchecked Sendable {
+    static let shared = ThumbnailCache()
+    private let cache = NSCache<NSURL, CGImage>()
+
+    init() { cache.countLimit = 500 }
+
+    /// JPEGs directly in the event folder, newest first (names are timestamps, so sort by name).
+    /// Subfolders such as `prints/` are not looked into.
+    nonisolated static func eventPhotos(in dir: URL) -> [URL] {
+        let files = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil,
+                                                                  options: [.skipsHiddenFiles])) ?? []
+        return files.filter { $0.pathExtension.lowercased() == "jpg" }
+            .sorted { $0.lastPathComponent > $1.lastPathComponent }
+    }
+
+    /// Cached, or decoded now (synchronous: call off the main thread).
+    func thumbnail(_ url: URL) -> CGImage? {
+        if let img = cache.object(forKey: url as NSURL) { return img }
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        let opts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: 360,
+        ]
+        guard let img = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { return nil }
+        cache.setObject(img, forKey: url as NSURL)
+        return img
+    }
+
+    /// The same, decoded on a background thread.
+    func thumbnail(for url: URL) async -> CGImage? {
+        await Task.detached(priority: .utility) { self.thumbnail(url) }.value
     }
 }
 

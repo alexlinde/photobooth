@@ -5,12 +5,12 @@ import os
 /// `<logDir>/booth-YYYYMMDD.log`. Use `BoothLog.info(.ui, "...")` etc.
 public enum BoothLog {
     public enum Category: String, Sendable {
-        case app, ui, booth, camera, input, storage, config, selftest
+        case app, ui, booth, camera, input, storage, config, selftest, printing
     }
 
     private static let loggers: [Category: Logger] = {
         var d: [Category: Logger] = [:]
-        for c in [Category.app, .ui, .booth, .camera, .input, .storage, .config, .selftest] {
+        for c in [Category.app, .ui, .booth, .camera, .input, .storage, .config, .selftest, .printing] {
             d[c] = Logger(subsystem: "PhotoBooth", category: c.rawValue)
         }
         return d

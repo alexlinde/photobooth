@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="50mm" height="148mm" viewBox="0 0 50 148">
+  <g id="Artwork">
+    <rect x="0" y="0" width="50" height="148" fill="#ffffff"/>
+  </g>
+  <g id="Guides - hide before export">
+    <rect x="4" y="4" width="42" height="28" fill="#d9d9d9" stroke="#555555" stroke-width="0.3" stroke-dasharray="1.5 1"/>
+    <text x="25" y="18.5" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="4.5" font-weight="bold" fill="#444444">PHOTO 1</text>
+    <text x="25" y="24" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="2.6" fill="#444444">42 × 28 mm</text>
+    <rect x="4" y="35" width="42" height="28" fill="#d9d9d9" stroke="#555555" stroke-width="0.3" stroke-dasharray="1.5 1"/>
+    <text x="25" y="49.5" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="4.5" font-weight="bold" fill="#444444">PHOTO 2</text>
+    <text x="25" y="55" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="2.6" fill="#444444">42 × 28 mm</text>
+    <rect x="4" y="66" width="42" height="28" fill="#d9d9d9" stroke="#555555" stroke-width="0.3" stroke-dasharray="1.5 1"/>
+    <text x="25" y="80.5" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="4.5" font-weight="bold" fill="#444444">PHOTO 3</text>
+    <text x="25" y="86" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="2.6" fill="#444444">42 × 28 mm</text>
+    <rect x="4" y="4" width="42" height="140" fill="none" stroke="#ff00ff" stroke-width="0.3" stroke-dasharray="1.5 1"/>
+    <text x="25" y="116" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="3.2" font-weight="bold" fill="#ff00ff">Your design:</text>
+    <text x="25" y="120.5" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="3.2" font-weight="bold" fill="#ff00ff">caption area 50 × 54 mm</text>
+    <text x="25" y="125" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="2" fill="#ff00ff">(y 94 to 148 mm)</text>
+    <text x="25" y="133" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="1.8" fill="#ff00ff">Edges may trim ~1–2 mm —</text>
+    <text x="25" y="135.5" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="1.8" fill="#ff00ff">extend backgrounds to the edge</text>
+    <text x="25" y="140" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="1.8" fill="#ff00ff">Magenta box = 4 mm safe zone</text>
+  </g>
+</svg>

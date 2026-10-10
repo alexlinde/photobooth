@@ -21,6 +21,10 @@ if options.selfTest {
     dispatchMain()
 }
 
+if let photos = options.renderPrint, let out = options.renderOut {
+    exit(RenderPrint.run(photos: photos, out: out, configPath: options.configPath))
+}
+
 if options.googleLogin {
     Task { @MainActor in exit(await GoogleLogin.run(configPath: options.configPath)) }
     dispatchMain()

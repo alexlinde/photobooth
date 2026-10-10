@@ -2,7 +2,8 @@
 
 A native macOS photo booth. A Sony ZV-E10 shows a mirrored live preview on a TV; a guest presses a big
 button, gets a 3-2-1 countdown, the camera fires (with strobes), and the photo is shown for a few seconds.
-Every photo is saved locally first and, optionally, uploaded to a shared Google Photos album.
+Every photo is saved locally first and, optionally, uploaded to a shared Google Photos album. The attendant
+can print photo strips on a Canon SELPHY.
 Design notes and rationale are in `SPEC.md`.
 
 ## Hardware
@@ -112,6 +113,10 @@ Config lives at `~/PhotoBooth/config.json` and is created with defaults on first
   "mirrorPreview" : true,
   "outputRoot" : "~/PhotoBooth",
   "pauseBetweenShotsSeconds" : 2,
+  "printCaption" : "",
+  "printMedia" : "Postcard.Fullbleed",
+  "printTemplate" : "print-strip.png",
+  "printer" : "",
   "reviewSeconds" : 5,
   "lighting" : "strobes",
   "shotsPerPress" : 1
@@ -135,6 +140,10 @@ Config lives at `~/PhotoBooth/config.json` and is created with defaults on first
 | `idlePrompt` | Text on the idle screen |
 | `lighting` | `"strobes"` (default), `"ambient"`, or `"none"` (don't touch the camera's settings). See below |
 | `profiles` | Optional per-field overrides of the built-in profiles. Written only when there are overrides |
+| `printer` | CUPS queue for photo strips. `""` = the first queue named like a SELPHY (`selphy`, or a model like `CP910`). The print window's picker saves it. See [Printing](#printing) |
+| `printMedia` | Paper size passed to `lp -o media=` |
+| `printTemplate` | Strip artwork (PNG/JPEG). Relative paths are inside `outputRoot`; `""` = none |
+| `printCaption` | Text under the photos when there's no artwork (`\n` for a new line). `""` = `eventName` |
 
 **Button key names:** `a`-`z`, `0`-`9`, `space`, `return`, `enter`, `tab`, `escape`, `delete`, arrows, `home`,
 `end`, `pageup`, `pagedown`, `f1`-`f24`, `kp0`-`kp9`, punctuation, or a raw HID usage like `hid:0x2c`
@@ -231,6 +240,48 @@ Copy `~/PhotoBooth/google_client.json` to the other Mac's `~/PhotoBooth/` and si
 client is what makes the albums "app-created" for both Macs, so each can list and reuse the other's albums.
 (A different OAuth client would see none of them.)
 
+## Printing
+
+Photo strips print on a **Canon SELPHY CP910** (dye-sub, 100 x 148 mm postcard paper, about a minute per
+sheet). Printing is never automatic: the attendant picks three photos and presses Print.
+
+**Add the printer once:** put the SELPHY on the same Wi-Fi as the Mac, then System Settings -> Printers &
+Scanners -> **Add Printer** and pick it (it's found as AirPrint, no driver needed). macOS names the queue
+`Canon_CP910`; with `"printer": ""` the booth picks it by itself.
+
+**The print window** (**⌘P**, or **Print…** in the control panel's Recent photos) opens on the attendant's display
+like the control panel:
+
+- Left: every photo in the event folder, newest first. Click to pick; the badge 1-3 is the photo's place on the
+  strip, top to bottom. Click again to un-pick (the rest renumber). **Last 3** picks the three newest, oldest first
+  (one press with `shotsPerPress` 3). **Clear** starts over.
+- Right: a preview of the sheet, **Copies** (1-5 sheets), and **Print** (enabled with three photos picked). After
+  sending, the selection clears and it says "Sent to printer".
+- Printer: the queue picker (saved to config.json), the printer's status, and its job queue with **Cancel** per job.
+  Status is checked every 3 s while the window is open. "Out of paper or a sheet didn't feed" means reload the
+  paper cassette; the print continues by itself. "Printer not reachable" means it's off or on another network.
+
+Each sheet is rendered to `~/PhotoBooth/<event>/prints/print-YYYYMMDD-HHMMSS.jpg` first, then sent with
+`lp -o media=Postcard.Fullbleed -o print-scaling=fill`. The file is what gets printed, so a failed print can be
+re-sent from Finder. Prints are not uploaded and don't show up among the photos.
+
+**Layout:** one sheet (100 x 148 mm, portrait) holds two identical strips side by side; cut it down the middle.
+Each strip is 50 x 148 mm: three 42 x 28 mm (3:2) photo windows at 4 mm from the left and 4, 35 and 66 mm from
+the top, and a caption area from 94 mm to the bottom. Photos are cropped to fill their windows (the sides of the camera's 16:9
+frame are trimmed). Sheets are rendered at 12 px/mm (1200 x 1776 px).
+
+**Artwork:** a PNG or JPEG of one strip, 600 x 1776 px (50:148), at `~/PhotoBooth/print-strip.png`
+(`printTemplate`). It's drawn under the photos, so the windows can be left blank. Other shapes are stretched to fit,
+with a warning in the print window. Without artwork the strips are white with the caption (`printCaption`, else the
+event name) centred under the photos. Designing it: [docs/print-template.md](docs/print-template.md), starting from
+`templates/print-strip-template.svg` / `.png`.
+
+**Paper tips:**
+- Fan the sheets before loading; paper that has sat in the cassette sticks together and doesn't feed.
+- The paper cassette holds 18 sheets. A KP-108IN set (ink + paper) is 108 prints; swap the ink cassette when the
+  printer asks.
+- About a minute per sheet, so a queue builds up quickly. Keep a spare pack nearby.
+
 ## Running the booth
 
 Launch `dist/PhotoBooth.app` (or `open dist/PhotoBooth.app`). It goes full-screen on the selected display,
@@ -267,7 +318,8 @@ Open with **⌘,**, or by clicking PhotoBooth's Dock icon. Closing it doesn't qu
 - **Apply & Save** (⌘S) validates, writes config.json and applies it the same way as Ctrl+Opt+Cmd+R.
   **Revert** discards edits. **Test shot** presses the button. **Pause booth** shows "Back in a moment" on the
   TV and ignores presses (a countdown is aborted; a photo already being taken is saved); **Resume** returns.
-- **Recent photos:** the last 8; click one to open it; **Show folder** reveals the event folder in Finder.
+- **Recent photos:** the last 8; click one to open it; **Print…** opens the [print window](#printing);
+  **Show folder** reveals the event folder in Finder.
 
 ### Button key: Print Screen
 
@@ -289,7 +341,8 @@ don't leave a text field focused. See `docs/stealthswitch3-protocol.md` for prog
 | **ATTENDANT NEEDED** | Repeated failures or a config / storage / permission problem. Fix it, then press Ctrl+Opt+Cmd+R (or Reset in the control panel). |
 | "Back in a moment" | Paused from the control panel; presses are ignored. |
 
-Attendant keys: **Ctrl+Opt+Cmd+Q** quit, **Ctrl+Opt+Cmd+R** retry / reload config, **⌘,** control panel.
+Attendant keys: **Ctrl+Opt+Cmd+Q** quit, **Ctrl+Opt+Cmd+R** retry / reload config, **⌘,** control panel,
+**⌘P** print window.
 Cmd+Q also quits.
 Esc does nothing. (Ctrl+Opt+Cmd+D simulates a camera disconnect, fake camera only.)
 
@@ -305,6 +358,8 @@ Logs: `~/PhotoBooth/logs/booth-YYYYMMDD.log`, and live with
 - [ ] Google signed in, and a test photo appears in the shared album
 - [ ] TV placement and `display` setting verified; Displays set to Extend; control panel on the laptop
 - [ ] Control panel shows the lighting profile applied (no refused settings) and the button connected
+- [ ] Printer on and found (print window status "Ready"), paper and ink loaded, and one test print with the
+      event's artwork looks right
 - [ ] Free disk space on the Mac
 
 ## Development
@@ -314,14 +369,16 @@ Modules:
 - `PTPKit`: pure PTP/Sony protocol code, no ImageCaptureCore (fully unit-tested)
 - `SonyCamera`: ImageCaptureCore transport, Sony session, `BoothCamera` implementation
 - `Uploader`: Google OAuth + Photos Library client, persistent upload queue
-- `BoothCore`: booth logic with no AppKit/SwiftUI: state machine, config, key map, fake camera, scenarios
+- `BoothCore`: booth logic with no AppKit/SwiftUI: state machine, config, key map, fake camera, scenarios, print
+  sheet layout and renderer, CUPS output parsing
 - `PhotoBooth`: the SwiftUI/AppKit app (views, HID input, app delegate, upload wiring)
 - `BoothSpike`: hardware spike / soak CLI (`booth-spike`)
 
 `PhotoBooth` flags: `--windowed`, `--fake-camera`, `--fake-fail-rate X`, `--config PATH`, `--learn-key`,
 `--google-login`, `--self-test` (runs the state-machine scenarios), `--auto-press SECONDS`,
 `--print-window-id`, `--snapshot-dir DIR` (PNGs of the booth window and the control panel after each state change,
-plus a full-height render of the panel). Develop without hardware (booth and control panel as normal windows):
+plus a full-height render of the panel), `--render-print A.jpg B.jpg C.jpg --out SHEET.jpg` (renders a print sheet
+with the configured artwork / caption and exits; prints nothing). Develop without hardware (booth and control panel as normal windows):
 
 ```sh
 swift run PhotoBooth --windowed --fake-camera

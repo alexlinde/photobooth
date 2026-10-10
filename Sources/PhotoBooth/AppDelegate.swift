@@ -57,6 +57,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var panelWindow: NSWindow?
     /// Display the panel was last placed on (so reopening it doesn't move it).
     private var panelScreenID: UInt32?
+    private var printModel: PrintModel?
+    private var printWindow: NSWindow?
+    private var printScreenID: UInt32?
     private var pointerMonitors: [Any] = []
 
     private enum Presentation { case windowed, kiosk, twoScreen }
@@ -65,6 +68,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return layout?.panel != nil ? .twoScreen : .kiosk
     }
     private var panelVisible: Bool { panelWindow?.isVisible == true }
+    private var printVisible: Bool { printWindow?.isVisible == true }
+    /// The control panel or the print window is open.
+    private var attendantWindowVisible: Bool { panelVisible || printVisible }
 
     init(options: AppOptions) {
         self.options = options
@@ -175,7 +181,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         model.uploads = uploads
         model.loadError = configError
         model.onSave = { [weak self] cfg in self?.saveConfig(cfg) }
+        model.onPrint = { [weak self] in self?.showPrint() }
         panelModel = model
+
+        let printModel = PrintModel(config: config)
+        printModel.onChoosePrinter = { [weak self] name in self?.savePrinter(name) }
+        self.printModel = printModel
 
         let input = ButtonInput(key: config.key, mode: config.buttonInput, deviceFilter: config.buttonDevice)
         input.onPress = { [weak self] in
@@ -284,7 +295,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 }
             }
         }
-        if case .review = s { panelModel?.refreshPhotos() }
+        if case .review = s {
+            panelModel?.refreshPhotos()
+            if printVisible { printModel?.refreshPhotos() }
+        }
         updateBoothLevel()
     }
 
@@ -333,6 +347,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return configError
     }
 
+    /// Print window printer picker: saved into config.json without a full reload (that would
+    /// re-apply the camera profile). With a broken config.json the choice lasts until quit.
+    private func savePrinter(_ name: String) {
+        var cfg = config
+        cfg.printer = name
+        if configError == nil {
+            do {
+                try ConfigLoader.save(cfg, path: options.configPath)
+            } catch {
+                BoothLog.error(.config, "Saving the printer choice failed: \(error)")
+            }
+        }
+        BoothLog.info(.printing, "Printer set to \(name)")
+        config = cfg
+        panelModel?.configApplied(cfg)
+    }
+
     private func reloadConfig() {
         let (cfg, err) = ConfigLoader.load(path: options.configPath)
         if let err {
@@ -346,6 +377,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // also fixes settings someone changed on the camera.
         camera?.setProfile(cfg.cameraProfile)
         panelModel?.configApplied(cfg)
+        printModel?.configApplied(cfg)
         let wasError = configError != nil
         configError = nil
         guard cfg != config || wasError else { return }
@@ -440,12 +472,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if !wasTwoScreen {
                 // TV plugged in: the panel moves to the laptop and the booth stops taking focus.
                 showPanel()
-            } else if let panelWindow, panelVisible, let p = layout?.panel, panelScreenID != p.id {
-                placePanel(panelWindow)
+                if let printWindow, printVisible {
+                    printWindow.level = .normal
+                    placePrintWindow(printWindow)
+                }
+            } else if let p = layout?.panel {
+                if let panelWindow, panelVisible, panelScreenID != p.id { placePanel(panelWindow) }
+                if let printWindow, printVisible, printScreenID != p.id { placePrintWindow(printWindow) }
             }
-        } else if wasTwoScreen, panelVisible {
-            // TV gone: the booth is back on this display, under the still-open panel.
-            panelWindow?.level = .floating
+        } else if wasTwoScreen {
+            // TV gone: the booth is back on this display, under the still-open windows.
+            if panelVisible { panelWindow?.level = .floating }
+            if printVisible { printWindow?.level = .floating }
         }
         updateBoothLevel()
         enforceKiosk()
@@ -472,7 +510,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         var level = Self.kioskLevel
         if presentation == .kiosk {
             let attendant: Bool = { if case .attendant = controller?.state { return true } else { return false } }()
-            if attendant || panelVisible { level = .normal }
+            if attendant || attendantWindowVisible { level = .normal }
         }
         if window.level != level { window.level = level }
     }
@@ -540,16 +578,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return w
     }
 
+    /// The display attendant windows go on: the panel display (two screens), else the booth's.
+    private var attendantScreen: NSScreen? {
+        switch presentation {
+        case .twoScreen: return layout?.panel.flatMap(Self.screen)
+        case .kiosk: return layout.flatMap { Self.screen($0.booth) }
+        case .windowed: return window.screen ?? NSScreen.main
+        }
+    }
+
     /// Two-screen: centred on the panel display (once per display, so the attendant can move
     /// it). Single-screen: centred on the booth display. Windowed: beside the booth window.
     private func placePanel(_ w: NSWindow) {
-        let target: NSScreen?
-        switch presentation {
-        case .twoScreen: target = layout?.panel.flatMap(Self.screen)
-        case .kiosk: target = layout.flatMap { Self.screen($0.booth) }
-        case .windowed: target = window.screen ?? NSScreen.main
-        }
-        guard let target else { return }
+        guard let target = attendantScreen else { return }
         let id = Self.displayID(target)
         if panelScreenID == id, w.frame.intersects(target.visibleFrame) { return }
         panelScreenID = id
@@ -563,9 +604,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         w.setFrame(NSRect(origin: origin, size: size), display: true)
     }
 
+    // MARK: Print window
+
+    @objc func showPrintWindow(_ sender: Any?) { showPrint() }
+
+    /// Opened like the control panel (same display and levels); status polling runs only while
+    /// it's open.
+    private func showPrint() {
+        guard let model = printModel else { return }
+        let isNew = printWindow == nil
+        let w = printWindow ?? makePrintWindow(model)
+        if isNew {
+            DispatchQueue.main.async { w.makeFirstResponder(nil) }
+        }
+        w.level = presentation == .kiosk ? .floating : .normal
+        if !w.isVisible || presentation == .twoScreen { placePrintWindow(w) }
+        model.opened()
+        w.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        panelVisibilityChanged()
+    }
+
+    private func makePrintWindow(_ model: PrintModel) -> NSWindow {
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1100, height: 760),
+                         styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
+        w.title = "PhotoBooth Print"
+        w.contentMinSize = NSSize(width: 900, height: 640)
+        w.isReleasedWhenClosed = false
+        w.acceptsMouseMovedEvents = true
+        w.collectionBehavior = [.fullScreenAuxiliary]
+        w.contentView = NSHostingView(rootView: PrintView(model: model))
+        w.delegate = self
+        printWindow = w
+        return w
+    }
+
+    /// Centred on the attendant display (once per display, like the panel).
+    private func placePrintWindow(_ w: NSWindow) {
+        guard let target = attendantScreen else { return }
+        let id = Self.displayID(target)
+        if printScreenID == id, w.frame.intersects(target.visibleFrame) { return }
+        printScreenID = id
+        let vf = target.visibleFrame
+        let size = NSSize(width: min(1100, vf.width - 40), height: min(760, vf.height - 40))
+        BoothLog.info(.ui, "Placing print window on display \"\(target.localizedName)\"")
+        w.setFrame(NSRect(x: vf.midX - size.width / 2, y: vf.midY - size.height / 2, width: size.width, height: size.height), display: true)
+    }
+
     func windowWillClose(_ notification: Notification) {
         guard let w = notification.object as? NSWindow else { return }
-        if w === panelWindow {
+        if w === printWindow {
+            printModel?.closed()
+            DispatchQueue.main.async { [weak self] in
+                MainActor.assumeIsolated { self?.panelVisibilityChanged() }
+            }
+        } else if w === panelWindow {
             // isVisible is still true during this callback.
             DispatchQueue.main.async { [weak self] in
                 MainActor.assumeIsolated { self?.panelVisibilityChanged() }
@@ -575,12 +668,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    /// Panel opened/closed. Single-screen kiosk: lower the booth and show the cursor while
-    /// it's open; restore kiosk mode when it closes.
+    /// Panel or print window opened/closed. Single-screen kiosk: lower the booth and show the
+    /// cursor while one is open; restore kiosk mode when the last one closes.
     private func panelVisibilityChanged() {
         updateBoothLevel()
         enforceKiosk()
-        if presentation == .kiosk, !panelVisible {
+        if presentation == .kiosk, !attendantWindowVisible {
             window.makeKeyAndOrderFront(nil)
         }
     }
@@ -593,8 +686,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         switch presentation {
         case .kiosk:
             NSApp.presentationOptions = [.hideDock, .hideMenuBar]
-            boothHost?.hidesCursor = !panelVisible
-            if panelVisible {
+            boothHost?.hidesCursor = !attendantWindowVisible
+            if attendantWindowVisible {
                 setCursorHidden(false)
             } else {
                 // Unhide + hide: macOS can show the cursor again after activation.
@@ -654,6 +747,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let panel = NSMenuItem(title: "Control Panel…", action: #selector(showControlPanel(_:)), keyEquivalent: ",")
             panel.target = self
             appMenu.addItem(panel)
+            let printItem = NSMenuItem(title: "Print…", action: #selector(showPrintWindow(_:)), keyEquivalent: "p")
+            printItem.target = self
+            appMenu.addItem(printItem)
             appMenu.addItem(.separator())
         }
         appMenu.addItem(withTitle: "Quit PhotoBooth", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")

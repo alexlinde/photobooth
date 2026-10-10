@@ -101,6 +101,15 @@ public struct BoothConfig: Codable, Equatable, Sendable {
     public var lighting = Lighting.strobes
     /// Per-field overrides of the built-in profiles (see LightingProfiles.swift).
     public var profiles = ProfileOverrides()
+    /// CUPS queue for photo strips; "" = the first SELPHY-looking queue (see `PrintQueues.autoPick`).
+    public var printer = ""
+    /// Passed to `lp` as `-o media=`.
+    public var printMedia = "Postcard.Fullbleed"
+    /// Strip artwork (PNG/JPEG of one 50 x 148 mm strip). Relative paths are inside `outputRoot`;
+    /// "" = no artwork.
+    public var printTemplate = "print-strip.png"
+    /// Text under the photos when there's no artwork; "" = `eventName`.
+    public var printCaption = ""
 
     public init() {}
 
@@ -108,6 +117,7 @@ public struct BoothConfig: Codable, Equatable, Sendable {
         case eventName, buttonKey, buttonInput, buttonDevice, debounceMs, countdownSeconds
         case reviewSeconds, shotsPerPress, pauseBetweenShotsSeconds, outputRoot, albumName
         case display, mirrorPreview, idlePrompt, lighting, profiles
+        case printer, printMedia, printTemplate, printCaption
     }
 
     public init(from decoder: Decoder) throws {
@@ -137,6 +147,10 @@ public struct BoothConfig: Codable, Equatable, Sendable {
         idlePrompt = try c.decodeIfPresent(String.self, forKey: .idlePrompt) ?? d.idlePrompt
         lighting = try c.decodeIfPresent(Lighting.self, forKey: .lighting) ?? d.lighting
         profiles = try c.decodeIfPresent(ProfileOverrides.self, forKey: .profiles) ?? d.profiles
+        printer = try c.decodeIfPresent(String.self, forKey: .printer) ?? d.printer
+        printMedia = try c.decodeIfPresent(String.self, forKey: .printMedia) ?? d.printMedia
+        printTemplate = try c.decodeIfPresent(String.self, forKey: .printTemplate) ?? d.printTemplate
+        printCaption = try c.decodeIfPresent(String.self, forKey: .printCaption) ?? d.printCaption
     }
 
     /// Written explicitly so the file stays readable and round-trips: `buttonDevice: null`
@@ -159,6 +173,10 @@ public struct BoothConfig: Codable, Equatable, Sendable {
         try c.encode(idlePrompt, forKey: .idlePrompt)
         try c.encode(lighting, forKey: .lighting)
         if !profiles.isEmpty { try c.encode(profiles, forKey: .profiles) }
+        try c.encode(printer, forKey: .printer)
+        try c.encode(printMedia, forKey: .printMedia)
+        try c.encode(printTemplate, forKey: .printTemplate)
+        try c.encode(printCaption, forKey: .printCaption)
     }
 
     // MARK: Derived / validated values
@@ -188,6 +206,21 @@ public struct BoothConfig: Codable, Equatable, Sendable {
 
     public var eventDirectoryURL: URL { outputRootURL.appendingPathComponent(eventFolderName, isDirectory: true) }
 
+    /// Rendered print sheets: a subfolder, so the photo listings and the upload queue (which
+    /// only look at the event folder's own JPEGs) skip them.
+    public var printsDirectoryURL: URL { eventDirectoryURL.appendingPathComponent("prints", isDirectory: true) }
+
+    /// `printTemplate` resolved: `~` expanded, relative paths inside `outputRoot`. nil = no artwork.
+    public var printTemplateURL: URL? {
+        let t = printTemplate.trimmingCharacters(in: .whitespaces)
+        if t.isEmpty { return nil }
+        let p = (t as NSString).expandingTildeInPath
+        return p.hasPrefix("/") ? URL(fileURLWithPath: p) : outputRootURL.appendingPathComponent(p)
+    }
+
+    /// Caption drawn when there's no artwork.
+    public var printCaptionText: String { printCaption.isEmpty ? eventName : printCaption }
+
     /// Returns human-readable problems; empty when valid.
     public func validationErrors() -> [String] {
         var errs: [String] = []
@@ -202,6 +235,7 @@ public struct BoothConfig: Codable, Equatable, Sendable {
         if !(1...10).contains(shotsPerPress) { errs.append("shotsPerPress must be 1–10 (got \(shotsPerPress)).") }
         if !(0...30).contains(pauseBetweenShotsSeconds) { errs.append("pauseBetweenShotsSeconds must be 0–30 (got \(pauseBetweenShotsSeconds)).") }
         if outputRoot.trimmingCharacters(in: .whitespaces).isEmpty { errs.append("outputRoot must not be empty.") }
+        if printMedia.trimmingCharacters(in: .whitespaces).isEmpty { errs.append("printMedia must not be empty (default \"Postcard.Fullbleed\").") }
         return errs
     }
 

@@ -17,6 +17,19 @@ public enum ImageDecoding {
         return CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary)
     }
 
+    /// The same for a file, without reading it all into memory first.
+    static func downsample(_ url: URL, maxPixel: Int) -> CGImage? {
+        let srcOpts = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, srcOpts) else { return nil }
+        let opts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+        ]
+        return CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary)
+    }
+
     /// A review decoder for `BoothController` that runs on a background thread.
     public static func reviewDecoder(maxPixel: Int) -> BoothController.ReviewDecoder {
         return { data in

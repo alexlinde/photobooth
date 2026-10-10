@@ -1,7 +1,7 @@
 # Photo Booth App — Project Brief
 
 ## Goal
-A simple, reliable macOS photo booth app. Live preview from the camera fills a TV. A guest presses a big USB button, a 3‑2‑1 countdown plays over the live preview, the camera captures a full‑resolution still with studio strobes, the photo is shown briefly, saved locally, and uploaded to a Google Photos album. Nothing else: no printing, video, boomerangs, filters, or editing.
+A simple, reliable macOS photo booth app. Live preview from the camera fills a TV. A guest presses a big USB button, a 3‑2‑1 countdown plays over the live preview, the camera captures a full‑resolution still with studio strobes, the photo is shown briefly, saved locally, and uploaded to a Google Photos album. Attendant-chosen photo strips can be printed on a Canon SELPHY (see README, Printing). Nothing else: no video, boomerangs, filters, or editing.
 
 This replaces LumaBooth (formerly dslrBooth), which works with this camera but is bloated.
 

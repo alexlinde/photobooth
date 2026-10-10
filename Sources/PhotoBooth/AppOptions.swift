@@ -15,6 +15,9 @@ struct AppOptions {
     var printWindowID = false
     /// Dev: save a PNG of the window into this directory shortly after each state change.
     var snapshotDir: String?
+    /// Hidden: `--render-print A B C --out FILE` renders a print sheet and exits.
+    var renderPrint: [String]?
+    var renderOut: String?
 
     static let usage = """
     Usage: PhotoBooth [options]
@@ -55,6 +58,8 @@ struct AppOptions {
                 o.autoPress = v
             case "--print-window-id": o.printWindowID = true
             case "--snapshot-dir": o.snapshotDir = try value(a)
+            case "--render-print": o.renderPrint = [try value(a), try value(a), try value(a)]
+            case "--out": o.renderOut = try value(a)
             case "-h", "--help": throw OptionError(nil)
             default:
                 // Ignore Xcode/LaunchServices noise like -NSDocumentRevisionsDebugMode / -psn_.
@@ -63,6 +68,8 @@ struct AppOptions {
                 throw OptionError("Unknown option \(a)")
             }
         }
+        if o.renderPrint != nil, o.renderOut == nil { throw OptionError("--render-print needs --out FILE") }
+        if o.renderOut != nil, o.renderPrint == nil { throw OptionError("--out is only used with --render-print") }
         return o
     }
 
