@@ -311,7 +311,7 @@ public final class BoothController {
                 prepareOutstanding = false
 
                 set(.capturing(shot: shot, of: n))
-                var photo: CapturedPhoto
+                let photo: CapturedPhoto
                 do {
                     photo = try await camera.capture()
                 } catch {
@@ -321,8 +321,6 @@ public final class BoothController {
                 }
                 guard id == sessionID else { return }
                 consecutiveFailures = 0
-                let original = photo.jpeg
-                photo.jpeg = await Task.detached(priority: .userInitiated) { JPEGOrientation.upright(original) }.value
                 BoothLog.info(.booth, "Captured shot \(shot)/\(n): \(photo.jpeg.count) bytes (\(photo.cameraFilename ?? "?"))")
 
                 // Save first (source of truth) while decoding the review image in parallel.
