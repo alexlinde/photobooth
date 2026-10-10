@@ -211,9 +211,8 @@ How uploads behave:
   State is in `~/PhotoBooth/.upload/`.
 - If you aren't signed in yet, photos queue and upload once you are.
 
-Open question: the app requests only the `photoslibrary.appendonly` scope (`photosAppendOnlyScope` in
-`Sources/Uploader/GoogleAuth.swift`). If uploads fail with a 403 mentioning scopes, the app may also need
-`photoslibrary.edit.appcreateddata`. **Test end to end before the event.**
+Scope: the app requests only `photoslibrary.appendonly`, which is enough to create its album and upload into it
+(verified end to end 2026-10-10). It can't read, share or delete anything in your library.
 
 Fallback (per SPEC): in Google Photos on the web, use "Back up folders" on the event folder.
 
