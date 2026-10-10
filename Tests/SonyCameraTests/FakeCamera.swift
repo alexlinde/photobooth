@@ -9,6 +9,11 @@ import ImageIO
 /// property polls (and a live-view GetObject that hangs before that, like the real one), AF
 /// that locks a few polls after a half-press, an image that appears after a full press, and
 /// the stale-object rule. It records every transaction and flags any overlap or rule breach.
+///
+/// Profile properties (`settings`) behave like the ZV-E10's: a SetControlDeviceA write shows up
+/// in GetAllDevicePropData only after `readbackLag` (`modeReadbackLag` for the exposure mode);
+/// exposure settings are display-only (isEnabled 2, empty enum) in Intelligent Auto and writes
+/// to them are silently ignored, as are writes sent while a mode change is still settling.
 @MainActor
 final class FakeCamera: CameraTransport {
     struct Call: CustomStringConvertible {
@@ -43,6 +48,10 @@ final class FakeCamera: CameraTransport {
     var usbAttached = false
     var openHangs = 0
     var latency: Duration = .milliseconds(1)
+    var readbackLag: Duration = .milliseconds(20)
+    var modeReadbackLag: Duration = .milliseconds(40)
+    /// Writes to these are acknowledged but never take (e.g. flash Off in A mode on the ZV-E10).
+    var ignoredWrites: Set<UInt16> = []
     /// Return an injection for a call to override the model's behaviour.
     var inject: ((Call) -> Injection?)?
     var liveViewPollsUntilOn = 2
@@ -53,7 +62,8 @@ final class FakeCamera: CameraTransport {
     var liveViewStatus: UInt64 = 0
     var focusFound: UInt64 = 1
     var objectInMemory: UInt64 = 0
-    var settingEffect: UInt64 = 1
+    var settings: [UInt16: Setting] = FakeCamera.iAutoSettings()
+    var mode: Int64 { settings[SonyProperty.exposureProgramMode]?.value ?? 0 }
     private var propertyPolls = 0
     private var halfPressed = false
     private var shotPending = false
@@ -68,6 +78,8 @@ final class FakeCamera: CameraTransport {
     private(set) var openCount = 0
     private(set) var closeCount = 0
     private(set) var violations: [String] = []
+    /// Writes the camera dropped because a mode change was still settling.
+    private(set) var droppedDuringModeChange: [UInt16] = []
     private var inFlight = 0
 
     let liveViewJPEG: Data = FakeCamera.makeJPEG()
@@ -136,10 +148,7 @@ final class FakeCamera: CameraTransport {
             w.u32(2); w.u16(SonyProperty.shutterHalfRelease); w.u16(SonyProperty.shutterRelease)
             return PTPResponse(code: PTPResponseCode.ok, data: w.data)
         case PTPOperation.sonySetControlDeviceA:
-            if call.parameters == [UInt32(SonyProperty.liveViewSettingEffect)] {
-                return PTPResponse(code: PTPResponseCode.accessDenied)  // display-only on the ZV-E10
-            }
-            return ok
+            return PTPResponse(code: controlA(call))
         case PTPOperation.sonySetControlDeviceB:
             controlB(call)
             return ok
@@ -193,7 +202,38 @@ final class FakeCamera: CameraTransport {
         }
     }
 
+    private func controlA(_ call: Call) -> UInt16 {
+        guard let code = call.parameters.first.map({ UInt16(truncatingIfNeeded: $0) }) else {
+            return PTPResponseCode.parameterNotSupported
+        }
+        if code == SonyProperty.priorityMode { return PTPResponseCode.ok }
+        guard var s = settings[code], let data = call.outData else { return PTPResponseCode.devicePropNotSupported }
+        var r = PTPReader(data)
+        guard let v = (try? r.value(ofType: s.type)).flatMap(\.int64) else { return PTPResponseCode.generalError }
+        let modeSettling = settings[SonyProperty.exposureProgramMode]?.pending != nil
+        if code != SonyProperty.exposureProgramMode, s.lockedIn(mode) || (modeSettling && s.followsMode) {
+            if modeSettling { droppedDuringModeChange.append(code) }
+            return PTPResponseCode.ok  // acknowledged, silently ignored
+        }
+        if ignoredWrites.contains(code) { return PTPResponseCode.ok }
+        let lag = code == SonyProperty.exposureProgramMode ? modeReadbackLag : readbackLag
+        s.pending = (v, .now + lag)
+        settings[code] = s
+        return PTPResponseCode.ok
+    }
+
+    /// Applies pending writes whose read-back lag has passed.
+    private func settleWrites() {
+        let now = ContinuousClock.now
+        for (code, s) in settings {
+            guard let p = s.pending, p.at <= now else { continue }
+            settings[code]?.value = p.value
+            settings[code]?.pending = nil
+        }
+    }
+
     private func pollProperties() {
+        settleWrites()
         propertyPolls += 1
         if liveViewStatus == 0, propertyPolls >= liveViewPollsUntilOn { liveViewStatus = 1 }
         if halfPressed, focusFound == 1 {
@@ -215,20 +255,100 @@ final class FakeCamera: CameraTransport {
 
     private func propertyBlob() -> Data {
         var w = PTPWriter()
-        w.u32(5); w.u32(0)
+        w.u32(UInt32(4 + settings.count)); w.u32(0)
         func u8prop(_ code: UInt16, _ v: UInt64) {
             w.u16(code); w.u16(PTPDataType.uint8); w.u8(0); w.u8(1); w.u8(0); w.u8(UInt8(v)); w.u8(0)
         }
         func u16prop(_ code: UInt16, _ v: UInt64) {
             w.u16(code); w.u16(PTPDataType.uint16); w.u8(0); w.u8(1); w.u16(0); w.u16(UInt16(v)); w.u8(0)
         }
-        u16prop(SonyProperty.focusMode, 0x8004)
         u8prop(SonyProperty.focusFound, focusFound)
         u16prop(SonyProperty.objectInMemory, objectInMemory)
         u8prop(SonyProperty.liveViewStatus, liveViewStatus)
-        u8prop(SonyProperty.liveViewSettingEffect, settingEffect)
+        for code in settings.keys.sorted() {
+            let s = settings[code]!
+            let locked = s.lockedIn(mode)
+            w.u16(code); w.u16(s.type); w.u8(1); w.u8(locked ? 2 : 1)
+            w.value(s.value, s.type); w.value(s.value, s.type)
+            if s.isRange {
+                w.u8(1); w.value(-1, s.type); w.value(100, s.type); w.value(1, s.type)
+            } else {
+                let offered = locked ? [] : s.offered
+                w.u8(2); w.u16(UInt16(offered.count))
+                offered.forEach { w.value($0, s.type) }
+            }
+        }
         return w.data
     }
+
+    // MARK: Profile properties
+
+    struct Setting {
+        var type: UInt16
+        var value: Int64
+        var offered: [Int64]
+        /// Display-only in Intelligent Auto (and dropped while a mode change settles).
+        var followsMode = true
+        /// Display-only in M too (exposure compensation).
+        var lockedInManual = false
+        var isRange = false
+        var pending: (value: Int64, at: ContinuousClock.Instant)?
+
+        func lockedIn(_ mode: Int64) -> Bool {
+            (followsMode && mode == SonyMode.iAuto) || (lockedInManual && mode == SonyMode.manual)
+        }
+    }
+
+    enum SonyMode {
+        static let manual: Int64 = 0x0000_0001
+        static let program: Int64 = 0x0001_0002
+        static let aperture: Int64 = 0x0002_0003
+        static let shutter: Int64 = 0x0003_0004
+        static let iAuto: Int64 = 0x0004_8000
+    }
+
+    /// A ZV-E10 left in Intelligent Auto by someone: none of the strobe settings in place.
+    static func iAutoSettings() -> [UInt16: Setting] {
+        let evSteps: [Int64] = [1000, 700, 300, 0, -300, -700, -1000]
+        return [
+            SonyProperty.exposureProgramMode: Setting(
+                type: PTPDataType.uint32, value: SonyMode.iAuto,
+                offered: [SonyMode.program, SonyMode.aperture, SonyMode.shutter, SonyMode.manual, 0x78050, SonyMode.iAuto, 0x48001],
+                followsMode: false),
+            SonyProperty.shutterSpeed: Setting(
+                type: PTPDataType.uint32, value: 0x0001_001E,  // 1/30
+                offered: [0, 0x012C_000A, 0x0001_0004, 0x0001_001E, 0x0001_00A0, 0x0001_00FA, 0x0001_0FA0]),
+            SonyProperty.fNumber: Setting(type: PTPDataType.uint16, value: 560, offered: [560, 800, 1100, 2200]),
+            SonyProperty.iso: Setting(type: PTPDataType.uint32, value: 0xFF_FFFF, offered: [0xFF_FFFF, 100, 200, 400, 800]),
+            SonyProperty.exposureBiasCompensation: Setting(type: PTPDataType.int16, value: 0, offered: evSteps,
+                                                           lockedInManual: true),
+            SonyProperty.flashMode: Setting(type: PTPDataType.uint16, value: 3, offered: [2, 1, 3, 0x8001, 0x8003],
+                                            followsMode: false),
+            SonyProperty.flashCompensation: Setting(type: PTPDataType.int16, value: 0, offered: evSteps),
+            SonyProperty.focusMode: Setting(type: PTPDataType.uint16, value: 0x8004, offered: [2, 0x8005, 0x8004, 0x8006, 1],
+                                            followsMode: false),
+            SonyProperty.whiteBalance: Setting(type: PTPDataType.uint16, value: 2, offered: [2, 4, 0x8011, 0x8010, 6, 7]),
+            SonyProperty.liveViewSettingEffect: Setting(type: PTPDataType.uint8, value: 1, offered: [1, 2]),
+            SonyProperty.batteryLevel: Setting(type: PTPDataType.int8, value: 80, offered: [], followsMode: false, isRange: true),
+        ]
+    }
+
+    /// The same body already set up exactly as `CameraProfile.strobes` asks.
+    static func strobeSettings() -> [UInt16: Setting] {
+        var s = iAutoSettings()
+        s[SonyProperty.exposureProgramMode]?.value = SonyMode.manual
+        s[SonyProperty.shutterSpeed]?.value = 0x0001_00A0
+        s[SonyProperty.fNumber]?.value = 800
+        s[SonyProperty.iso]?.value = 100
+        s[SonyProperty.focusMode]?.value = 2
+        s[SonyProperty.liveViewSettingEffect]?.value = 2
+        return s
+    }
+
+    /// Current (read-back) value of a profile property.
+    func value(_ code: UInt16) -> Int64? { settings[code]?.value }
+
+    var controlAWrites: [Call] { calls.filter { $0.code == PTPOperation.sonySetControlDeviceA && $0.parameters != [UInt32(SonyProperty.priorityMode)] } }
 
     static func makeJPEG() -> Data {
         let ctx = CGContext(data: nil, width: 8, height: 8, bitsPerComponent: 8, bytesPerRow: 0,
@@ -240,5 +360,15 @@ final class FakeCamera: CameraTransport {
         CGImageDestinationAddImage(dest, ctx.makeImage()!, nil)
         CGImageDestinationFinalize(dest)
         return out as Data
+    }
+}
+
+private extension PTPWriter {
+    mutating func value(_ v: Int64, _ type: UInt16) {
+        switch type {
+        case PTPDataType.int8, PTPDataType.uint8: u8(UInt8(truncatingIfNeeded: v))
+        case PTPDataType.int16, PTPDataType.uint16: u16(UInt16(truncatingIfNeeded: v))
+        default: u32(UInt32(truncatingIfNeeded: v))
+        }
     }
 }

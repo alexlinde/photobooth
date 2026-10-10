@@ -88,16 +88,6 @@ public final class SonySession {
         try await transport.transact(PTPOperation.sonySetControlDeviceB, [UInt32(code)], outData: value.encoded(as: type))
     }
 
-    /// Tries to turn Live View Display "Setting Effect" off (config.c:7763: uint8, 1 On, 2 Off)
-    /// so the preview isn't dark at strobe exposure. The ZV-E10 reports the property as
-    /// display-only, so this may well be refused; callers treat failure as non-fatal.
-    /// Returns the value read back afterwards.
-    public func disableLiveViewSettingEffect() async throws -> UInt64? {
-        try await setControlA(SonyProperty.liveViewSettingEffect, .uint(2), type: PTPDataType.uint8)
-        try await refreshProperties()
-        return currentValue(SonyProperty.liveViewSettingEffect)
-    }
-
     // MARK: - Live view
 
     /// Waits until LiveViewStatus (0xD221) reports 1. Right after the handshake it reads 0, and a

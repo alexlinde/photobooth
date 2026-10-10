@@ -95,9 +95,12 @@ public struct CameraProfile: Sendable, Equatable {
         liveViewSettingEffect: false)
 
     /// No strobes: the camera meters the room. Preview shows the real exposure.
+    /// Flash mode is left alone: the ZV-E10 only offers Off/Auto in its auto modes and silently
+    /// keeps Fill in A (verified), so asking for Off would always report a mismatch. With no
+    /// strobe trigger on the hot shoe, Fill fires nothing.
     public static let ambient = CameraProfile(
         name: "Ambient", exposureMode: .aperturePriority, aperture: 5.6, iso: .auto, exposureCompensation: 0,
-        flashMode: .off, focusMode: .single, whiteBalance: .auto, liveViewSettingEffect: true)
+        focusMode: .single, whiteBalance: .auto, liveViewSettingEffect: true)
 }
 
 /// What happened when a profile was applied, one item per requested setting.

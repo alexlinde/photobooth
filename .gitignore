@@ -3,3 +3,4 @@ spike-output/
 dist/
 *.xcodeproj
 .swiftpm/
+.claude/worktrees/

@@ -7,18 +7,20 @@ import PTPKit
 /// The real `BoothCamera`: a Sony body in PC Remote mode over ImageCaptureCore.
 ///
 /// A supervisor task owns the connection: searching → connecting (open session, handshake,
-/// drain stale object, optional Setting Effect off, wait for live view) → ready (live view
+/// drain stale object, wait for live view, apply the camera profile) → ready (live view
 /// loop) → on any failure: recovering, close, back off, start over. Every PTP transaction of
-/// a session goes through one `GatedTransport`, so live view, focus polling and capture
-/// never overlap, and a transaction that never completes poisons only that session.
+/// a session goes through one `GatedTransport`, so live view, focus polling, profile writes and
+/// capture never overlap, and a transaction that never completes poisons only that session.
+///
+/// The profile is applied before `.ready` on every connect, so the booth never shoots with
+/// whatever the camera's menus were left at, and again whenever `setProfile` is called while
+/// ready. One apply runs at a time and never alongside a capture or half-press: a capture (or
+/// prepare) waits for an apply in flight, and an apply requested meanwhile waits for the capture.
 @MainActor
 public final class SonyBoothCamera: BoothCamera {
     public struct Options {
         /// How long to wait for AF after the half-press before firing anyway.
         public var focusTimeout: Duration = .seconds(3)
-        /// Try to turn Live View Display "Setting Effect" off (0xD231 = 2). The ZV-E10 reports
-        /// the property as display-only, so this is best-effort and failure is only logged.
-        public var disableLiveViewSettingEffect = true
         /// Keep live view running between half-press and full press, so the countdown plays
         /// over a live picture. Live view always pauses from the full press until download.
         public var liveViewDuringFocus = true
@@ -45,6 +47,10 @@ public final class SonyBoothCamera: BoothCamera {
         public var discoveryPollTimeout: Duration = .seconds(5)
         public var initialBackoff: Duration = .milliseconds(500)
         public var maxBackoff: Duration = .seconds(10)
+        /// Profile apply: read-back polling (see `ProfileApplier`).
+        public var profileModeSettleTimeout: Duration = .seconds(5)
+        public var profileSettleTimeout: Duration = .seconds(3)
+        public var profilePollInterval: Duration = .milliseconds(200)
 
         public init() {}
     }
@@ -125,6 +131,9 @@ public final class SonyBoothCamera: BoothCamera {
 
     public func prepareCapture() async {
         guard state.isReady, let conn = current, conn.isAlive, !capturing, conn.halfPressedAt == nil else { return }
+        // Let an apply in flight finish first: the shot must use the new settings.
+        await waitForProfileApply()
+        guard state.isReady, current === conn, conn.isAlive, !capturing, conn.halfPressedAt == nil else { return }
         conn.halfPressedAt = .now
         if !options.liveViewDuringFocus { conn.beginPrepareHold() }
         do {
@@ -147,12 +156,19 @@ public final class SonyBoothCamera: BoothCamera {
         } catch {
             log("cancelPrepare: release failed: \(Self.describe(error))", .error)
         }
+        startQueuedProfileApply()
     }
 
     public func capture() async throws -> CapturedPhoto {
         guard !capturing else { throw BoothCameraError.captureInProgress }
         guard state.isReady, let conn = current, conn.isAlive else { throw BoothCameraError.notReady }
         capturing = true
+        // Claimed `capturing` first, so no new apply starts; now let one in flight finish.
+        await waitForProfileApply()
+        guard current === conn, conn.isAlive else {
+            capturing = false
+            throw BoothCameraError.notReady
+        }
         let s = conn.session
         var timing = SonySession.CaptureTiming()
         let start = ContinuousClock.now
@@ -164,6 +180,8 @@ public final class SonyBoothCamera: BoothCamera {
             if holdingLiveView { conn.liveViewHolds -= 1 }
             conn.endPrepareHold()
             capturing = false
+            if current === conn, conn.isAlive { updateStatus { $0.readout = s.readout } }
+            startQueuedProfileApply()
         }
 
         do {
@@ -217,16 +235,80 @@ public final class SonyBoothCamera: BoothCamera {
         }
     }
 
-    // MARK: - Profile (stub: stored and published, not yet applied — see CameraProfile.swift)
+    // MARK: - Profile
 
     public private(set) var status = CameraStatus()
     private let statusBroadcaster = Broadcaster<CameraStatus>()
+    /// The apply running while ready (at most one).
+    private var applyTask: Task<Void, Never>?
+    /// `setProfile` came in while an apply, capture or half-press was in progress, or while
+    /// connecting; applied (with the newest profile) as soon as that finishes.
+    private var applyQueued = false
 
     public func statusUpdates() -> AsyncStream<CameraStatus> { statusBroadcaster.subscribe(initial: status) }
 
     public func setProfile(_ profile: CameraProfile?) {
-        status.profile = profile
-        statusBroadcaster.yield(status)
+        updateStatus { $0.profile = profile }
+        log("camera profile set to \(profile.map { "\"\($0.name)\"" } ?? "none (leave camera as is)")")
+        applyQueued = true
+        startQueuedProfileApply()
+    }
+
+    /// Starts the queued apply if the camera is ready and idle; otherwise it stays queued. A newer
+    /// `setProfile` before it starts just replaces the profile it will read.
+    private func startQueuedProfileApply() {
+        guard applyQueued, applyTask == nil, !capturing, state.isReady,
+              let conn = current, conn.isAlive, conn.halfPressedAt == nil else { return }
+        applyQueued = false
+        applyTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.applyProfile(on: conn)
+            } catch {
+                // A transport failure has already faulted `conn` (GatedTransport); anything else
+                // is logged and the connection left alone.
+                self.log("camera profile apply aborted: \(Self.describe(error))", .error)
+            }
+            if self.current === conn { self.applyTask = nil }
+            self.startQueuedProfileApply()
+        }
+    }
+
+    /// Waits for the apply in flight (if any), including one queued behind it.
+    private func waitForProfileApply() async {
+        while let t = applyTask { await t.value }
+    }
+
+    /// Applies `status.profile` to `conn` and publishes the report and readout. Device refusals
+    /// end up in the report; only transport errors throw.
+    private func applyProfile(on conn: Connection) async throws {
+        guard let profile = status.profile else {
+            updateStatus {
+                $0.lastReport = nil
+                $0.readout = conn.session.readout
+            }
+            return
+        }
+        updateStatus { $0.applyingProfile = true }
+        defer { if current === conn { updateStatus { $0.applyingProfile = false } } }
+        var applier = ProfileApplier(session: conn.session, log: { [weak self] in self?.log($0) })
+        applier.modeSettleTimeout = options.profileModeSettleTimeout
+        applier.settleTimeout = options.profileSettleTimeout
+        applier.pollInterval = options.profilePollInterval
+        let report = try await applier.apply(profile)
+        guard current === conn, conn.isAlive else { return }
+        updateStatus {
+            $0.lastReport = report
+            $0.readout = conn.session.readout
+        }
+    }
+
+    private func updateStatus(_ change: (inout CameraStatus) -> Void) {
+        var s = status
+        change(&s)
+        guard s != status else { return }
+        status = s
+        statusBroadcaster.yield(s)
     }
 
     // MARK: - Fault injection
@@ -318,23 +400,20 @@ public final class SonyBoothCamera: BoothCamera {
         let drained = try await session.drainStaleObjects()
         if drained > 0 { log("drained \(drained) stale object(s) left in camera RAM") }
 
-        if options.disableLiveViewSettingEffect {
-            do {
-                let v = try await session.disableLiveViewSettingEffect()
-                log("Live View Setting Effect is now \(v.map(String.init) ?? "?") (2 = Off)")
-            } catch {
-                // A refusal is a normal response; a transport failure has already faulted `conn`
-                // and the next step will throw.
-                log("Live View Setting Effect not changed (non-fatal): \(Self.describe(error))")
-            }
-        }
         try await session.waitForLiveView(timeout: options.liveViewStartTimeout)
+
+        // Profile before `.ready`, so no capture can happen with the wrong settings. Any
+        // `setProfile` from here on is covered: this apply reads the newest profile.
+        guard gen == generation, conn.isAlive else { throw CancellationError() }
+        applyQueued = false
+        try await applyProfile(on: conn)
 
         guard gen == generation, conn.isAlive else { throw CancellationError() }
         connectCount += 1
         log("ready: \(name) after \(SonySession.CaptureTiming.ms(ContinuousClock.now - t0))")
         setState(.ready(name: name))
         conn.liveViewTask = Task { [weak self] in await self?.runLiveView(conn) }
+        startQueuedProfileApply()  // a setProfile that arrived during the apply above
         return conn
     }
 
@@ -346,6 +425,15 @@ public final class SonyBoothCamera: BoothCamera {
             conn.fault(reason)
         }
         transport.closeSession()
+        // An apply in flight unwinds on its own (its gate is poisoned); it no longer counts.
+        // The profile stays requested and is applied on the next connect.
+        applyTask = nil
+        applyQueued = false
+        updateStatus {
+            $0.applyingProfile = false
+            $0.lastReport = nil
+            $0.readout = nil
+        }
     }
 
     // MARK: - Live view

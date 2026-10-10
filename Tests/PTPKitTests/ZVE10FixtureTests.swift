@@ -34,3 +34,28 @@ private func fixture(_ name: String) throws -> Data {
     #expect(ops.contains(PTPOperation.sonySDIOConnect))
     #expect(ops.contains(PTPOperation.sonyGetAllDevicePropData))
 }
+
+// The recorded blob was captured in Intelligent Auto, which is why the profile properties
+// below are display-only there (isEnabled 2) and the exposure ones offer no values.
+@Test func recordedBlobHasProfilePropertiesWithExpectedTypes() throws {
+    let props = SonyPropertyParser.parse(try fixture("getalldevicepropdata"))
+    let mode = try #require(props[SonyProperty.exposureProgramMode])
+    #expect(mode.dataType == PTPDataType.uint32)
+    #expect(mode.currentValue == .uint(0x0004_8000))  // Intelligent Auto
+    #expect(mode.isEnabled == 1)
+
+    let expected: [(UInt16, UInt16)] = [
+        (SonyProperty.whiteBalance, PTPDataType.uint16), (SonyProperty.fNumber, PTPDataType.uint16),
+        (SonyProperty.focusMode, PTPDataType.uint16), (SonyProperty.flashMode, PTPDataType.uint16),
+        (SonyProperty.exposureBiasCompensation, PTPDataType.int16), (SonyProperty.flashCompensation, PTPDataType.int16),
+        (SonyProperty.shutterSpeed, PTPDataType.uint32), (SonyProperty.iso, PTPDataType.uint32),
+        (SonyProperty.liveViewSettingEffect, PTPDataType.uint8), (SonyProperty.batteryLevel, PTPDataType.int8),
+    ]
+    for (code, type) in expected {
+        #expect(props[code]?.dataType == type, "\(hex16(code))")
+    }
+    #expect(props[SonyProperty.fNumber]?.isEnabled == 2)
+    #expect(props[SonyProperty.fNumber]?.form == .enumeration([]))
+    #expect(props[SonyProperty.liveViewSettingEffect]?.isEnabled == 2)
+    #expect(props[SonyProperty.batteryLevel]?.form == .range(min: .int(-1), max: .int(100), step: .int(1)))
+}

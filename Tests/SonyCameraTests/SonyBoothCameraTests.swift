@@ -7,7 +7,7 @@ import Testing
 // MARK: - Harness
 
 @MainActor
-private func makeCamera(_ fake: FakeCamera, configure: (inout SonyBoothCamera.Options) -> Void = { _ in })
+func makeCamera(_ fake: FakeCamera, configure: (inout SonyBoothCamera.Options) -> Void = { _ in })
     -> SonyBoothCamera
 {
     var o = SonyBoothCamera.Options()
@@ -25,13 +25,16 @@ private func makeCamera(_ fake: FakeCamera, configure: (inout SonyBoothCamera.Op
     o.discoveryPollTimeout = .milliseconds(50)
     o.initialBackoff = .milliseconds(20)
     o.maxBackoff = .milliseconds(80)
+    o.profileModeSettleTimeout = .seconds(1)
+    o.profileSettleTimeout = .milliseconds(500)
+    o.profilePollInterval = .milliseconds(5)
     configure(&o)
     return SonyBoothCamera(transport: fake, options: o)
 }
 
 /// Records every state the camera publishes.
 @MainActor
-private final class StateRecorder {
+final class StateRecorder {
     private(set) var states: [CameraConnectionState] = []
     private var task: Task<Void, Never>?
     init(_ camera: SonyBoothCamera) {
@@ -46,7 +49,7 @@ private final class StateRecorder {
 }
 
 @MainActor
-private func waitUntil(_ what: String, timeout: Duration = .seconds(5),
+func waitUntil(_ what: String, timeout: Duration = .seconds(5),
                        _ condition: () -> Bool) async throws {
     let t0 = ContinuousClock.now
     while !condition() {
@@ -63,10 +66,10 @@ private extension Array where Element == FakeCamera.Call {
     func lastIndex(_ p: (FakeCamera.Call) -> Bool) -> Int? { lastIndex(where: p) }
 }
 
-private let halfPress: (FakeCamera.Call) -> Bool = { $0.isControlB(SonyProperty.shutterHalfRelease, 2) }
-private let halfRelease: (FakeCamera.Call) -> Bool = { $0.isControlB(SonyProperty.shutterHalfRelease, 1) }
-private let fullPress: (FakeCamera.Call) -> Bool = { $0.isControlB(SonyProperty.shutterRelease, 2) }
-private let fullRelease: (FakeCamera.Call) -> Bool = { $0.isControlB(SonyProperty.shutterRelease, 1) }
+let halfPress: (FakeCamera.Call) -> Bool = { $0.isControlB(SonyProperty.shutterHalfRelease, 2) }
+let halfRelease: (FakeCamera.Call) -> Bool = { $0.isControlB(SonyProperty.shutterHalfRelease, 1) }
+let fullPress: (FakeCamera.Call) -> Bool = { $0.isControlB(SonyProperty.shutterRelease, 2) }
+let fullRelease: (FakeCamera.Call) -> Bool = { $0.isControlB(SonyProperty.shutterRelease, 1) }
 
 // MARK: - Connection
 
@@ -88,8 +91,10 @@ private let fullRelease: (FakeCamera.Call) -> Bool = { $0.isControlB(SonyPropert
         "SDIOConnect(0x00000003,0x00000000,0x00000000)",
         "SetControlDeviceA(0x0000D25A)=1",
     ])
-    // Setting Effect off was attempted (and refused, non-fatally).
-    #expect(fake.calls.contains { $0.code == PTPOperation.sonySetControlDeviceA && $0.parameters == [0xD231] && $0.value == 2 })
+    // No profile requested: nothing written beyond PriorityMode.
+    #expect(fake.controlAWrites.isEmpty)
+    #expect(camera.status.lastReport == nil)
+    #expect(camera.status.readout?.exposureMode == "Intelligent Auto")
     // No live-view GetObject until LiveViewStatus read 1 (the fake would hang and flag it).
     #expect(fake.violations.isEmpty, "\(fake.violations)")
     #expect(rec.states.first == .searching)

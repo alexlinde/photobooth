@@ -5,7 +5,9 @@ import SonyCamera
 
 // Phase 0 spike: prove the ImageCaptureCore → Sony PTP path end to end.
 //   booth-spike [--frames N] [--no-capture] [--out DIR] [--quiet-liveview] [--set 0xCODE=VALUE ...]
-//   (--set writes a property via SetControlDeviceA after the handshake and reports the read-back.)
+//               [--profile strobes|ambient]
+//   (--set writes a property via SetControlDeviceA after the handshake and reports the read-back;
+//    --profile then applies a camera profile with the booth's ProfileApplier and prints the report.)
 // Phase 1 soak: run SonyBoothCamera for a while, capturing every 20 s.
 //   booth-spike --soak SECONDS [--soak-fault] [--trace]
 
@@ -18,6 +20,7 @@ struct Options {
     var soakFault = false
     var trace = false
     var sets: [(code: UInt16, value: Int64)] = []
+    var profile: CameraProfile?
 
     init(_ args: [String]) {
         var it = args.dropFirst().makeIterator()
@@ -35,6 +38,12 @@ struct Options {
                 guard kv.count == 2, let code = Options.int(kv[0]).flatMap({ UInt16(exactly: $0) }),
                       let value = Options.int(kv[1]) else { print("--set wants 0xCODE=VALUE"); exit(2) }
                 sets.append((code, value))
+            case "--profile":
+                switch it.next() {
+                case "strobes": profile = .strobes
+                case "ambient": profile = .ambient
+                default: print("--profile wants strobes or ambient"); exit(2)
+                }
             default: print("unknown argument \(a)"); exit(2)
             }
         }
@@ -117,6 +126,20 @@ func run() async {
         }
     }
 
+    // 3c. Camera profile
+    if let profile = opts.profile {
+        step("3c. Apply camera profile \"\(profile.name)\"")
+        do {
+            let report = try await ProfileApplier(session: session).apply(profile)
+            say("report: \(report.allOK ? "all OK" : "\(report.problems.count) problem(s)")")
+            for item in report.items {
+                say("  " + item.setting.padding(toLength: 26, withPad: " ", startingAt: 0)
+                    + item.requested.padding(toLength: 30, withPad: " ", startingAt: 0) + ProfileApplier.describe(item.outcome))
+            }
+            say("readout: \(describe(session.readout))")
+        } catch { fail("profile apply", error) }
+    }
+
     // 4. Property dump
     step("4. Property dump")
     do {
@@ -196,6 +219,7 @@ func run() async {
             try data.write(to: url)
             say("✓ captured \(name ?? "?"), \(data.count / 1024) KB → \(url.path)")
             say("timing: \(timing)")
+            say("readout: \(describe(session.readout))")
             if let src = CGImageSourceCreateWithData(data as CFData, nil),
                let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [String: Any] {
                 let exif = props[kCGImagePropertyExifDictionary as String] as? [String: Any]
@@ -219,6 +243,11 @@ func run() async {
     transport.closeSession()
     step("SPIKE PASSED")
     exit(0)
+}
+
+func describe(_ r: CameraReadout) -> String {
+    "mode \(r.exposureMode ?? "?"), shutter \(r.shutterSpeed ?? "?"), \(r.aperture ?? "f/?"), ISO \(r.iso ?? "?"), "
+        + "flash \(r.flashMode ?? "?"), focus \(r.focusMode ?? "?"), battery \(r.batteryPercent.map { "\($0)%" } ?? "?")"
 }
 
 /// Minimal ISO 15740 DeviceInfo parser for the sanity check.
