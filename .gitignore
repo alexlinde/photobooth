@@ -5,3 +5,8 @@ dist/
 .swiftpm/
 .claude/worktrees/
 .DS_Store
+tools/stealthswitch3/*.dylib
+tools/stealthswitch3/*.dSYM/
+tools/stealthswitch3/ssw_readonly_test
+tools/stealthswitch3/captures/
+__pycache__/
