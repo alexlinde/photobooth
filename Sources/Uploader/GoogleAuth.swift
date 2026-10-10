@@ -6,10 +6,18 @@ import os
 private let log = Logger(subsystem: "PhotoBooth", category: "upload")
 
 public let photosAppendOnlyScope = "https://www.googleapis.com/auth/photoslibrary.appendonly"
+/// Read-only, and only for albums and media this app created (lets the booth list its own albums).
+public let photosReadAppCreatedScope = "https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata"
 
 /// What the Photos uploader needs from auth. `GoogleAuth` conforms; tests use a fake.
 public protocol AccessTokenProviding: Sendable {
     func accessToken(forceRefresh: Bool) async throws -> String
+    /// Whether the token may call `albums.list` (the read-only app-created scope was granted).
+    var canListAlbums: Bool { get }
+}
+
+public extension AccessTokenProviding {
+    var canListAlbums: Bool { false }
 }
 
 struct GoogleClientConfig: Sendable {
@@ -52,6 +60,13 @@ public final class GoogleAuth: AccessTokenProviding, @unchecked Sendable {
     /// True when a refresh token is stored.
     public var isAuthorized: Bool { ((try? store.load()) ?? nil) != nil }
 
+    /// Scopes Google recorded for this sign-in; empty when unknown (e.g. signed in before they were tracked).
+    public var grantedScopes: Set<String> {
+        Set(((try? store.loadScopes()) ?? nil)?.split(separator: " ").map(String.init) ?? [])
+    }
+
+    public var canListAlbums: Bool { grantedScopes.contains(photosReadAppCreatedScope) }
+
     public func signOut() throws {
         setCached(nil, nil)
         try store.delete()
@@ -88,6 +103,8 @@ public final class GoogleAuth: AccessTokenProviding, @unchecked Sendable {
             if resp.status >= 500 || resp.status == 429 { throw UploadError.transient(msg) }
             throw UploadError.permanent(msg)
         }
+        // A refresh that omits `scope` keeps what was recorded at sign-in.
+        if let scope = resp.scope, !scope.isEmpty { try? store.saveScopes(scope) }
         setCached(token, resp.expiresIn)
         return token
     }
@@ -109,7 +126,7 @@ public final class GoogleAuth: AccessTokenProviding, @unchecked Sendable {
             .init(name: "client_id", value: cfg.clientID),
             .init(name: "redirect_uri", value: redirect),
             .init(name: "response_type", value: "code"),
-            .init(name: "scope", value: photosAppendOnlyScope),
+            .init(name: "scope", value: [photosAppendOnlyScope, photosReadAppCreatedScope].joined(separator: " ")),
             .init(name: "code_challenge", value: PKCE.challenge(for: verifier)),
             .init(name: "code_challenge_method", value: "S256"),
             .init(name: "state", value: state),
@@ -132,6 +149,7 @@ public final class GoogleAuth: AccessTokenProviding, @unchecked Sendable {
             throw UploadError.permanent("Code exchange failed: \(resp.error ?? "no refresh token returned")")
         }
         try store.save(refresh)
+        try? store.saveScopes(resp.scope)  // nil clears a stale value from an earlier sign-in
         setCached(access, resp.expiresIn)
         log.info("Google authorization complete")
     }
@@ -143,6 +161,7 @@ public final class GoogleAuth: AccessTokenProviding, @unchecked Sendable {
         var accessToken: String?
         var refreshToken: String?
         var expiresIn: TimeInterval?
+        var scope: String?
         var error: String?
     }
 
@@ -163,6 +182,7 @@ public final class GoogleAuth: AccessTokenProviding, @unchecked Sendable {
                 accessToken: j["access_token"] as? String,
                 refreshToken: j["refresh_token"] as? String,
                 expiresIn: (j["expires_in"] as? NSNumber)?.doubleValue,
+                scope: j["scope"] as? String,
                 error: j["error"] as? String)
         } catch let e as URLError {
             throw UploadError.transient("Network error contacting Google: \(e.localizedDescription)")

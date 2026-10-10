@@ -3,8 +3,40 @@ import os
 
 private let log = Logger(subsystem: "PhotoBooth", category: "upload")
 
+/// An album this app created, as reported by `albums.list`.
+public struct RemoteAlbum: Sendable, Equatable, Identifiable {
+    public var id: String
+    public var title: String
+    public var mediaItemsCount: Int?
+    public var productUrl: URL?
+
+    public init(id: String, title: String, mediaItemsCount: Int? = nil, productUrl: URL? = nil) {
+        self.id = id; self.title = title; self.mediaItemsCount = mediaItemsCount; self.productUrl = productUrl
+    }
+}
+
 public actor GooglePhotosUploader: PhotoUploading {
-    private struct State: Codable { var albumId: String?; var albumTitle: String? }
+    /// Every album this app has created or discovered: title -> album ID. `created` (album ID ->
+    /// creation time, only for albums made on this Mac) breaks ties if a listing has two albums
+    /// with one title. The pre-map format `{albumId, albumTitle}` is migrated on load.
+    private struct State {
+        var albums: [String: String] = [:]
+        var created: [String: Double] = [:]
+
+        static func load(from url: URL) -> (state: State, migrated: Bool) {
+            guard let d = try? Data(contentsOf: url),
+                  let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return (State(), false) }
+            if let a = j["albums"] as? [String: String] {
+                return (State(albums: a, created: j["created"] as? [String: Double] ?? [:]), false)
+            }
+            if let id = j["albumId"] as? String, let t = j["albumTitle"] as? String {
+                return (State(albums: [t: id]), true)
+            }
+            return (State(), false)
+        }
+
+        var json: [String: Any] { ["albums": albums, "created": created] }
+    }
 
     private let auth: AccessTokenProviding
     private let albumTitle: String
@@ -12,12 +44,21 @@ public actor GooglePhotosUploader: PhotoUploading {
     private let session: URLSession
     private var state: State
     private var recreatedAlbum = false
+    /// Listing failed for lack of the read scope; don't ask again this run.
+    private var listingDenied = false
 
     static func isAlbumGone(_ message: String) -> Bool {
         let m = message.lowercased()
         guard m.contains("album") else { return false }
         if m.contains("permission") || m.contains("insufficient") || m.contains("scope") { return false }
         return m.contains("not found") || m.contains("not_found") || m.contains("http 404") || m.contains("invalid album")
+    }
+
+    /// A 403 caused by a missing OAuth scope (as opposed to any other refusal).
+    static func isScopeDenied(_ message: String) -> Bool {
+        let m = message.lowercased()
+        guard m.hasPrefix("http 403") else { return false }
+        return m.contains("insufficient") || m.contains("permission_denied") || m.contains("scope")
     }
 
     static let base = "https://photoslibrary.googleapis.com/v1"
@@ -27,11 +68,56 @@ public actor GooglePhotosUploader: PhotoUploading {
         self.albumTitle = albumTitle
         self.stateURL = stateURL
         self.session = session
-        if let d = try? Data(contentsOf: stateURL), let s = try? JSONDecoder().decode(State.self, from: d) {
-            self.state = s
-        } else {
-            self.state = State()
+        let (s, migrated) = State.load(from: stateURL)
+        self.state = s
+        if migrated { Self.write(s, to: stateURL) }
+    }
+
+    /// Albums remembered on this Mac (title -> album ID), without asking Google.
+    public func knownAlbums() -> [String: String] { state.albums }
+
+    /// Lists the albums this app created (needs the `readonly.appcreateddata` scope) and merges
+    /// them into the remembered set: Google is authoritative for IDs, and unknown titles are added.
+    public func listAppAlbums() async throws -> [RemoteAlbum] {
+        var out: [RemoteAlbum] = []
+        var pageToken: String?
+        for _ in 0..<100 {
+            var comps = URLComponents(string: Self.base + "/albums")!
+            comps.queryItems = [.init(name: "pageSize", value: "50")]
+                + (pageToken.map { [.init(name: "pageToken", value: $0)] } ?? [])
+            let data: Data
+            do { (data, _) = try await send(url: comps.url!, method: "GET") }
+            catch UploadError.permanent(let msg) where Self.isScopeDenied(msg) {
+                listingDenied = true
+                throw UploadError.permanent(msg)
+            }
+            guard let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw UploadError.transient("albums.list returned invalid JSON")
+            }
+            for a in j["albums"] as? [[String: Any]] ?? [] {
+                guard let id = a["id"] as? String, let title = a["title"] as? String else { continue }
+                let count = (a["mediaItemsCount"] as? String).flatMap(Int.init) ?? (a["mediaItemsCount"] as? NSNumber)?.intValue
+                out.append(RemoteAlbum(id: id, title: title, mediaItemsCount: count,
+                                       productUrl: (a["productUrl"] as? String).flatMap(URL.init(string:))))
+            }
+            guard let next = j["nextPageToken"] as? String, !next.isEmpty else { break }
+            pageToken = next
         }
+        merge(out)
+        return out
+    }
+
+    private func merge(_ remote: [RemoteAlbum]) {
+        var byTitle: [String: [String]] = [:]
+        for a in remote { byTitle[a.title, default: []].append(a.id) }
+        for (title, ids) in byTitle {
+            if let known = state.albums[title], ids.contains(known) { continue }
+            // Same title twice and neither remembered: newest known creation time, else the last listed.
+            state.albums[title] = ids.dropFirst().reduce(ids[0]) { best, id in
+                (state.created[id] ?? 0) >= (state.created[best] ?? 0) ? id : best
+            }
+        }
+        saveState()
     }
 
     public func upload(fileURL: URL) async throws {
@@ -49,22 +135,31 @@ public actor GooglePhotosUploader: PhotoUploading {
             log.error("Album not found; recreating once")
             recreatedAlbum = true
             clearAlbum()
-            albumId = try await ensureAlbum()
+            albumId = try await ensureAlbum(listFirst: false)
             try await createMediaItem(token: uploadToken, albumId: albumId, name: fileURL.lastPathComponent)
         }
     }
 
     // MARK: Steps
 
-    private func ensureAlbum() async throws -> String {
-        if let id = state.albumId, state.albumTitle == albumTitle { return id }
+    private func ensureAlbum(listFirst: Bool = true) async throws -> String {
+        if let id = state.albums[albumTitle] { return id }
+        // Another Mac may already have made this album: look before creating a duplicate.
+        if listFirst, auth.canListAlbums, !listingDenied {
+            do { _ = try await listAppAlbums() }
+            catch UploadError.permanent(let msg) where Self.isScopeDenied(msg) {
+                log.info("Album listing not permitted (scope not granted); creating the album")
+            }
+            if let id = state.albums[albumTitle] { return id }
+        }
         let body = try JSONSerialization.data(withJSONObject: ["album": ["title": albumTitle]])
         let (data, _) = try await send(path: "/albums", contentType: "application/json", body: body)
         guard let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let id = j["id"] as? String else {
             throw UploadError.transient("albums.create returned no id")
         }
-        state = State(albumId: id, albumTitle: albumTitle)
+        state.albums[albumTitle] = id
+        state.created[id] = Date().timeIntervalSince1970
         saveState()
         log.info("Created album")
         return id
@@ -106,14 +201,19 @@ public actor GooglePhotosUploader: PhotoUploading {
 
     private func send(path: String, contentType: String, body: Data,
                       extra: [String: String] = [:]) async throws -> (Data, HTTPURLResponse) {
+        try await send(url: URL(string: Self.base + path)!, method: "POST", contentType: contentType, body: body, extra: extra)
+    }
+
+    private func send(url: URL, method: String, contentType: String? = nil, body: Data? = nil,
+                      extra: [String: String] = [:]) async throws -> (Data, HTTPURLResponse) {
         var forceRefresh = false
         for attempt in 0..<2 {
             let token = try await auth.accessToken(forceRefresh: forceRefresh)
-            var req = URLRequest(url: URL(string: Self.base + path)!)
-            req.httpMethod = "POST"
+            var req = URLRequest(url: url)
+            req.httpMethod = method
             req.httpBody = body
             req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-            req.setValue(contentType, forHTTPHeaderField: "Content-Type")
+            if let contentType { req.setValue(contentType, forHTTPHeaderField: "Content-Type") }
             for (k, v) in extra { req.setValue(v, forHTTPHeaderField: k) }
 
             let data: Data, resp: HTTPURLResponse
@@ -143,13 +243,16 @@ public actor GooglePhotosUploader: PhotoUploading {
         String((String(data: d, encoding: .utf8) ?? "").prefix(300))
     }
 
-    private func clearAlbum() { state = State(); saveState() }
+    /// Forgets the configured title's album (the others stay remembered).
+    private func clearAlbum() { state.albums[albumTitle] = nil; saveState() }
 
-    private func saveState() {
+    private func saveState() { Self.write(state, to: stateURL) }
+
+    private static func write(_ state: State, to stateURL: URL) {
         do {
             try FileManager.default.createDirectory(
                 at: stateURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try JSONEncoder().encode(state).write(to: stateURL, options: .atomic)
+            try JSONSerialization.data(withJSONObject: state.json, options: [.sortedKeys]).write(to: stateURL, options: .atomic)
         } catch {
             log.error("Failed to save album state: \(error.localizedDescription, privacy: .public)")
         }

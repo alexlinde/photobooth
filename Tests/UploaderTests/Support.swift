@@ -79,7 +79,10 @@ final class FakeAuth: AccessTokenProviding, @unchecked Sendable {
     private let lock = NSLock()
     private var _refreshes = 0
     private let failRefresh: Bool
-    init(failRefresh: Bool = false) { self.failRefresh = failRefresh }
+    let canListAlbums: Bool
+    init(failRefresh: Bool = false, canListAlbums: Bool = false) {
+        self.failRefresh = failRefresh; self.canListAlbums = canListAlbums
+    }
     var refreshes: Int { lock.lock(); defer { lock.unlock() }; return _refreshes }
     func accessToken(forceRefresh: Bool) async throws -> String {
         lock.lock(); defer { lock.unlock() }
@@ -93,7 +96,7 @@ final class FakeAuth: AccessTokenProviding, @unchecked Sendable {
 
 /// URLProtocol stub keyed by a per-test header so tests can run in parallel.
 final class StubProtocol: URLProtocol, @unchecked Sendable {
-    struct Req { var url: URL; var headers: [String: String]; var body: Data }
+    struct Req { var url: URL; var method: String = "GET"; var headers: [String: String]; var body: Data }
     struct Resp { var status: Int; var body: Data }
     nonisolated(unsafe) static var handlers: [String: (Req) -> Resp] = [:]
     nonisolated(unsafe) static var requests: [String: [Req]] = [:]
@@ -124,7 +127,7 @@ final class StubProtocol: URLProtocol, @unchecked Sendable {
         var h: [String: String] = [:]
         for (k, v) in request.allHTTPHeaderFields ?? [:] { h[k.lowercased()] = v }
         let id = h["x-test-id"] ?? ""
-        let req = Req(url: request.url!, headers: h, body: body)
+        let req = Req(url: request.url!, method: request.httpMethod ?? "GET", headers: h, body: body)
         Self.lock.lock()
         Self.requests[id, default: []].append(req)
         let handler = Self.handlers[id]

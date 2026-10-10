@@ -202,7 +202,7 @@ final class ControlPanelModel {
         guard let b = button, b.mode == .hid, b.deviceDescription != nil else { return nil }
         if b.seized == true { return ("Seized: its keystrokes reach only the booth", .green) }
         if b.seized == false {
-            return ("Not seized (\(b.seizeFailure ?? "error")): the button also types into the focused app", .orange)
+            return ("The button also types into the focused app (program it to F13 to avoid this)", .orange)
         }
         return nil
     }
@@ -216,6 +216,7 @@ extension ProfileField: Identifiable {
 
 struct ControlPanelView: View {
     @Bindable var model: ControlPanelModel
+    @State private var creatingAlbum = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -410,10 +411,72 @@ struct ControlPanelView: View {
 
     // MARK: Booth
 
+    private static let newAlbumTag = "\u{0}new-album"
+
+    /// Albums this booth made: Google's list if we have it, else what this Mac remembers.
+    private var albumChoices: [(title: String, label: String)] {
+        guard let u = model.uploads else { return [] }
+        var rows: [(String, String)]
+        if let remote = u.remoteAlbums {
+            rows = remote.map { a in (a.title, a.mediaItemsCount.map { "\(a.title) (\($0) photos)" } ?? a.title) }
+        } else {
+            rows = u.localAlbumTitles.map { ($0, $0) }
+        }
+        let current = model.draft.albumName
+        if !current.isEmpty, !rows.contains(where: { $0.0 == current }) {
+            rows.insert((current, "\(current) (will be created)"), at: 0)
+        }
+        var seen = Set<String>()
+        return rows.filter { seen.insert($0.0).inserted }.sorted { $0.0.localizedCaseInsensitiveCompare($1.0) == .orderedAscending }
+    }
+
+    @ViewBuilder
+    private var albumPicker: some View {
+        if let u = model.uploads, u.signedIn != nil {
+            let selection = Binding<String>(
+                get: { creatingAlbum ? Self.newAlbumTag : model.draft.albumName },
+                set: { v in
+                    if v == Self.newAlbumTag { creatingAlbum = true }
+                    else { creatingAlbum = false; model.draft.albumName = v }
+                })
+            HStack {
+                Picker("Album", selection: selection) {
+                    ForEach(albumChoices, id: \.title) { Text($0.label).tag($0.title) }
+                    Divider()
+                    Text("New album…").tag(Self.newAlbumTag)
+                }
+                .pickerStyle(.menu)
+                Button {
+                    Task { await u.refreshAlbums() }
+                } label: {
+                    if u.refreshingAlbums { ProgressView().controlSize(.small) } else { Text("Refresh") }
+                }
+                .disabled(!u.canListAlbums || u.refreshingAlbums)
+                .help(u.canListAlbums ? "Ask Google Photos for the albums this booth created"
+                                      : "Sign in again to list your albums")
+            }
+            if creatingAlbum {
+                TextField("New album title", text: $model.draft.albumName)
+            }
+            if u.signedIn == true && !u.canListAlbums {
+                HStack {
+                    Text("Sign in again to see your albums.").font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Sign in again") { Task { await u.signIn() } }.disabled(u.signingIn)
+                }
+            }
+            if let e = u.albumsError {
+                Text("Couldn't list albums: \(e)").font(.caption).foregroundStyle(.red).lineLimit(2)
+            }
+        } else {
+            TextField("Album name", text: $model.draft.albumName)
+        }
+    }
+
     private var boothSection: some View {
         Section {
             TextField("Event name", text: $model.draft.eventName)
-            TextField("Album name", text: $model.draft.albumName)
+            albumPicker
             Stepper("Countdown: \(model.draft.countdownSeconds) s", value: $model.draft.countdownSeconds, in: 0...10)
             Stepper("Review: \(Int(model.draft.reviewSeconds)) s", value: $model.draft.reviewSeconds, in: 1...60, step: 1)
             Stepper("Photos per press: \(model.draft.shotsPerPress)", value: $model.draft.shotsPerPress, in: 1...10)

@@ -10,12 +10,9 @@ import IOKit.hid
 ///   switches back once it is.
 /// - `local` mode: `NSEvent` local monitor (app must be focused). The device filter cannot
 ///   apply in this mode.
-/// - Seizing: in `hid` mode with a device filter, the device is opened with
-///   `kIOHIDOptionsTypeSeizeDevice`, so its keystrokes reach only us, not the focused app
-///   (e.g. the control panel's text fields). Never without a filter (that would swallow every
-///   keyboard) and never in learn mode. If seizing fails we open normally and say so in
-///   `Status`. A seized device's keys never reach the NSEvent path, so it can't double-trigger;
-///   unseized, the local path ignores the button key while in `hid` mode.
+/// - No seizing: macOS only lets root open a keyboard exclusively, so the button's key also
+///   reaches the focused app (see `openHID`). The local path ignores the button key while in
+///   `hid` mode, so it can't double-trigger.
 ///
 /// A local monitor is always installed for the attendant shortcuts (Ctrl+Opt+Cmd+Q quit,
 /// Ctrl+Opt+Cmd+R reset/reload, Ctrl+Opt+Cmd+D fake-camera disconnect) and to swallow plain
@@ -225,36 +222,18 @@ final class ButtonInput {
 
     private func openHID() -> Bool {
         let matches = matchingDictionaries()
-        // Seize only when every matching dictionary pins the vendor and product ID, i.e. the
-        // manager can only ever match the button, never the laptop keyboard.
-        let filtered = !matches.isEmpty && matches.allSatisfy { $0[kIOHIDVendorIDKey] != nil && $0[kIOHIDProductIDKey] != nil }
-        let seize = deviceFilter != nil && !learn && filtered
-        seized = nil
-        seizeFailure = nil
+        // No kIOHIDOptionsTypeSeizeDevice: macOS only lets root seize a keyboard (non-root gets
+        // kIOReturnNotPrivileged with the button attached), and a seize that "succeeds" because
+        // the button isn't plugged in yet leaves a later hot-plugged button unopenable. So the
+        // button's key also reaches the focused app; program it to F13 to make that harmless.
+        seized = deviceFilter != nil && !learn ? false : nil
+        seizeFailure = seized == false ? "macOS lets only root seize a keyboard" : nil
         matchedDevices = 0
-        if seize {
-            let m = makeManager(matches)
-            let rc = IOHIDManagerOpen(m, IOOptionBits(kIOHIDOptionsTypeSeizeDevice))
-            if rc == kIOReturnSuccess {
-                seized = true
-                BoothLog.info(.input, "IOHIDManagerOpen(seize) → kIOReturnSuccess: button keystrokes go only to PhotoBooth")
-                manager = m
-                return true
-            }
-            // A fresh manager for the plain open: reopening this one wouldn't report the
-            // already-matched devices again.
-            discard(m)
-            seized = false
-            seizeFailure = String(format: "0x%08X", rc) + (rc == kIOReturnNotPrivileged ? " not privileged" : "")
-            BoothLog.error(.input, String(format: "IOHIDManagerOpen(seize) failed: 0x%08X; opening without seizing (the button also types into the focused app)", rc))
-        }
         let m = makeManager(matches)
         let rc = IOHIDManagerOpen(m, IOOptionBits(kIOHIDOptionsTypeNone))
         guard rc == kIOReturnSuccess else {
             BoothLog.error(.input, String(format: "IOHIDManagerOpen failed: 0x%08X", rc))
             discard(m)
-            seized = nil
-            seizeFailure = nil
             return false
         }
         manager = m

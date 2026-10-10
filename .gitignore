@@ -4,3 +4,4 @@ dist/
 *.xcodeproj
 .swiftpm/
 .claude/worktrees/
+.DS_Store

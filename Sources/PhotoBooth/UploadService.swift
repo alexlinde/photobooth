@@ -19,12 +19,21 @@ final class UploadService {
     let albumTitle: String
     @ObservationIgnored let queue: UploadQueue?
     @ObservationIgnored let auth: GoogleAuth?
+    @ObservationIgnored let uploader: GooglePhotosUploader?
     /// Latest queue state (nil until the first report, or when uploads are off).
     private(set) var snapshot: UploadQueueSnapshot?
     /// nil = no google_client.json (uploads off).
     private(set) var signedIn: Bool?
     private(set) var signingIn = false
     var signInError: String?
+    /// Signed in with the scope that lets us list the booth's albums.
+    private(set) var canListAlbums = false
+    /// Albums from Google's last listing (nil until a Refresh succeeds).
+    private(set) var remoteAlbums: [RemoteAlbum]?
+    /// Albums remembered on this Mac (title -> ID).
+    private(set) var localAlbumTitles: [String] = []
+    private(set) var refreshingAlbums = false
+    var albumsError: String?
     @ObservationIgnored private var watcher: Task<Void, Never>?
 
     static func clientConfigURL(_ config: BoothConfig) -> URL {
@@ -44,22 +53,25 @@ final class UploadService {
             BoothLog.info(.storage, "No \(Self.clientConfigURL(config).path); Google Photos upload disabled (local save only)")
             queue = nil
             self.auth = nil
+            uploader = nil
             return
         }
         self.auth = auth
-        let authorized = auth.isAuthorized
-        if !authorized {
-            BoothLog.error(.storage, "Google Photos not signed in — photos will queue until you run `PhotoBooth --google-login`")
-        }
         let stateDir = config.outputRootURL.appendingPathComponent(".upload", isDirectory: true)
         let uploader = GooglePhotosUploader(auth: auth, albumTitle: albumTitle,
                                             stateURL: stateDir.appendingPathComponent("album.json"))
+        self.uploader = uploader
         let q = UploadQueue(stateURL: stateDir.appendingPathComponent("queue-\(config.eventFolderName).json"),
                             uploader: uploader)
         queue = q
-        signedIn = authorized
+        signedIn = false
         let folder = eventDirectory
         watcher = Task { [weak self] in
+            await self?.refreshAuthState()
+            if self?.signedIn == false {
+                BoothLog.error(.storage, "Google Photos not signed in — photos will queue until you sign in from the control panel")
+            }
+            self?.localAlbumTitles = await uploader.knownAlbums().keys.sorted()
             // Catch photos saved but never enqueued (crash between the two), then run.
             await q.reconcile(folder: folder)
             await q.start()
@@ -94,8 +106,36 @@ final class UploadService {
             BoothLog.error(.storage, "Google sign-in failed: \(error)")
             signInError = "\(error)"
         }
-        signedIn = auth.isAuthorized
-        if signedIn == true { await queue?.retryNow() }
+        await refreshAuthState()
+        if signedIn == true {
+            await queue?.retryNow()
+            if canListAlbums { await refreshAlbums() }
+        }
+    }
+
+    /// Control panel "Refresh": asks Google for the albums this app created.
+    func refreshAlbums() async {
+        guard let uploader, !refreshingAlbums else { return }
+        refreshingAlbums = true
+        albumsError = nil
+        defer { refreshingAlbums = false }
+        do {
+            remoteAlbums = try await uploader.listAppAlbums()
+        } catch {
+            BoothLog.error(.storage, "Listing albums failed: \(error)")
+            albumsError = "\(error)"
+        }
+        localAlbumTitles = await uploader.knownAlbums().keys.sorted()
+        await refreshAuthState()
+    }
+
+    /// Reads the sign-in state off the main thread: a Keychain read can block on an access
+    /// prompt (e.g. after a rebuild changes the code signature), which must not freeze the booth.
+    private func refreshAuthState() async {
+        guard let auth else { return }
+        let (authorized, canList) = await Task.detached { (auth.isAuthorized, auth.canListAlbums) }.value
+        signedIn = authorized
+        canListAlbums = canList
     }
 
     func stop() {

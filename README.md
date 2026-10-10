@@ -205,16 +205,31 @@ Without `google_client.json` the booth just saves locally.
    Approve in the browser. Expect "Google hasn't verified this app": Advanced -> continue.
 5. The app creates the album (title = `albumName`). **Share it manually in Google Photos**; the API can't.
 
+Albums: since March 2025 the Photos Library API only lets an app add to albums **it created itself**, so the booth
+always creates its own album and can't upload into one you made by hand. It remembers every album it has created
+(`~/PhotoBooth/.upload/album.json`, title -> album ID), so switching `albumName` back and forth reuses albums instead
+of making duplicates. The control panel's Booth section lists them (**Refresh** asks Google; "New album…" starts a
+new one). Sharing is still manual, in Google Photos.
+
 How uploads behave:
 - Photos are always saved locally first: `~/PhotoBooth/<event>/YYYYMMDD-HHMMSS.jpg` is the source of truth.
 - Uploads go through a persistent queue: retried with backoff, paused while offline, resumed on restart.
   State is in `~/PhotoBooth/.upload/`.
 - If you aren't signed in yet, photos queue and upload once you are.
 
-Scope: the app requests only `photoslibrary.appendonly`, which is enough to create its album and upload into it
-(verified end to end 2026-10-10). It can't read, share or delete anything in your library.
+Scopes: `photoslibrary.appendonly` is enough to create the album and upload into it (verified end to end
+2026-10-10). The app also requests `photoslibrary.readonly.appcreateddata`, which only lets it see albums and photos
+**this app created** (never the rest of your library), so it can list its albums and find one made from another Mac
+instead of creating a duplicate. It can't share or delete anything. Existing sign-ins only have the first scope and
+keep uploading unchanged; click **Sign in again** in the control panel (or run `--google-login`) once to enable listing.
 
 Fallback (per SPEC): in Google Photos on the web, use "Back up folders" on the event folder.
+
+### Running the booth from another Mac
+
+Copy `~/PhotoBooth/google_client.json` to the other Mac's `~/PhotoBooth/` and sign in there. Using the same OAuth
+client is what makes the albums "app-created" for both Macs, so each can list and reuse the other's albums.
+(A different OAuth client would see none of them.)
 
 ## Running the booth
 
@@ -254,15 +269,13 @@ Open with **⌘,**, or by clicking PhotoBooth's Dock icon. Closing it doesn't qu
   TV and ignores presses (a countdown is aborted; a photo already being taken is saved); **Resume** returns.
 - **Recent photos:** the last 8; click one to open it; **Show folder** reveals the event folder in Finder.
 
-### Button seize
+### The button also types
 
-With `buttonDevice` set (the default) and HID input, the app tries to open the button **exclusively**
-(`kIOHIDOptionsTypeSeizeDevice`), so its "a" doesn't also type into whatever has focus, such as the control
-panel's album field. It never seizes without a `buttonDevice` filter (that would capture every keyboard) or in
-`--learn-key` mode. If macOS refuses (the log shows `IOHIDManagerOpen(seize) failed`, and the panel shows "the
-button also types into the focused app"), the app opens normally and the button still works. On macOS 26 a
-normal user process gets `0xE00002C1` (not privileged), so expect this; just don't leave a text field focused in
-the panel. Opening the panel doesn't focus a text field.
+The StealthSwitch is a USB keyboard, so its key reaches whatever app has focus too (e.g. an "a" in the
+control panel's album field). The app can't take the button exclusively: macOS only lets root seize a keyboard.
+Fix it at the source: program the StealthSwitch to send **F13** (Ultimarc's configuration utility) and set
+`"buttonKey": "f13"`; F13 types nothing anywhere. Until then, just don't leave a text field focused.
+Opening the panel doesn't focus one.
 
 | Screen | Meaning |
 |---|---|
