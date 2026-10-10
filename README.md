@@ -93,7 +93,7 @@ Config lives at `~/PhotoBooth/config.json` and is created with defaults on first
     "vendorID" : "0x1324"
   },
   "buttonInput" : "hid",
-  "buttonKey" : "space",
+  "buttonKey" : "a",
   "countdownSeconds" : 3,
   "debounceMs" : 400,
   "display" : "auto",

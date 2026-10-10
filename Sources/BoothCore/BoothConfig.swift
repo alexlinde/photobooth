@@ -82,7 +82,7 @@ public struct BoothConfig: Codable, Equatable, Sendable {
 
     public var eventName = "PhotoBooth"
     /// Raw config string, parsed by `KeySpec.parse` (see KeyMap.swift for the names).
-    var buttonKey = "space"
+    var buttonKey = "a"  // StealthSwitch 3 port 1 as shipped
     public var buttonInput = ButtonInput.hid
     /// HID mode only: only accept presses from this USB device. `null` = any keyboard.
     public var buttonDevice: DeviceFilter? = .stealthSwitch3
