@@ -314,6 +314,29 @@ To check the checksum independently without risking a bad write, look at the sta
 - [?] What `control mode = 0x04` does. The shipped apps never send it. It may be worth one deliberate test later, *after* a known-good permanent configuration is stored.
 - [?] Whether the device needs a replug or re-enumerates after "end download". Watch the log for terminate/first-match notifications, which the app also registers for.
 
+### 6.4 Capture results (2026-10-10, macOS 26, Apple silicon via Rosetta) [V]
+
+Three downloads were captured: the Print Screen config, then sw1–5 = A–E, then Print Screen again.
+
+- **Request sequence:** byte for byte as in section 2: start (`0xE9` wValue 1), then 3 × (`0xEB` 32 bytes, `0xEA` status), then end (`0xE9` wValue 0).
+- **Status byte:** `0x01` after every block, including blocks 1 and 2.
+- **`USBDeviceOpenSeize`:** succeeds as a normal user on macOS 26, even with the HID drivers attached. No root is needed.
+- **Image layout:**
+  - matches section 3, including checksum byte 57 (`0x75` for Print Screen, `0xB0` for A–E);
+  - control mode 0;
+  - macros unset (`0xFF`);
+  - bytes 75–95 zero.
+- **Codes:** Print Screen is `0x7F`. A–E are set-2 codes `1C 32 21 23 24` at inputs 8, 10, 12, 5 and 3 (switches 1–5 in the app's numbering).
+
+Print Screen config image:
+```
+ff 00 00 ff 00 ff 00 00 7f 00 ff 00 ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ff
+00 ff 00 00 ff 00 ff 00 ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 75 00 ff ff ff ff ff
+ff ff ff ff ff ff ff ff ff ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+```
+
+Still open: the physical jack labels versus app switch numbers, F7/toggle/macro semantics, and control mode `0x04`.
+
 ---
 
 ## 7. Reimplementation sketch (after confirmation)
