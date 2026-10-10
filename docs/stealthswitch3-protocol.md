@@ -351,6 +351,8 @@ Timeouts can be looser than the app's 50/100 ms. No HID or kernel driver work is
 
 ### 7.1 Programming without the app
 
+Verified on hardware on 2026-10-10. `sswprog 1=a --write` made port 1 type `a`, and `sswprog 1=printscreen --write` restored Print Screen. Every status byte was `0x01`, and no root was needed.
+
 `tools/stealthswitch3/sswprog.c` (built by `build.sh`, universal arm64 + x86_64) implements the sequence in 2.2. Without `--write` it is a dry run that never opens the device.
 
 ```
