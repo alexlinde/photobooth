@@ -1,0 +1,5 @@
+.build*/
+spike-output/
+dist/
+*.xcodeproj
+.swiftpm/
