@@ -77,7 +77,7 @@ public struct BoothConfig: Codable, Equatable, Sendable {
             String(format: "vendor 0x%04X / product 0x%04X", vendorID, productID)
         }
 
-        /// Ultimarc StealthSwitch 3 ("Button/Joystick/Trackball Interface").
+        /// H-Mod StealthSwitch 3 ("Button/Joystick/Trackball Interface").
         static let stealthSwitch3 = DeviceFilter(vendorID: 0x1324, productID: 0x0103)
     }
 

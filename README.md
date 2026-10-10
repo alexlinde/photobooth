@@ -12,7 +12,7 @@ Design notes and rationale are in `SPEC.md`.
 - USB-C cable camera to Mac (control only; live view and photos come over USB)
 - Strobes fired by a radio trigger on the camera hot shoe
 - TV on HDMI as an external display
-- Ultimarc StealthSwitch 3 with a big arcade button on **port 1** (USB VID `0x1324` / PID `0x0103`;
+- H-Mod StealthSwitch 3 with a big arcade button on **port 1** (USB VID `0x1324` / PID `0x0103`;
   presents as keyboard + mouse)
 
 ## Camera settings
@@ -273,7 +273,7 @@ Open with **⌘,**, or by clicking PhotoBooth's Dock icon. Closing it doesn't qu
 
 The StealthSwitch is a USB keyboard, so its key reaches whatever app has focus too (e.g. an "a" in the
 control panel's album field). The app can't take the button exclusively: macOS only lets root seize a keyboard.
-Fix it at the source: program the StealthSwitch to send **F13** (Ultimarc's configuration utility) and set
+Fix it at the source: program the StealthSwitch to send **F13** (H-Mod's configuration software; its Mac version predates current macOS, so use the Windows one on any PC — the setting is stored in the switch) and set
 `"buttonKey": "f13"`; F13 types nothing anywhere. Until then, just don't leave a text field focused.
 Opening the panel doesn't focus one.
 
