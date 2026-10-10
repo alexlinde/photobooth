@@ -92,6 +92,13 @@ public struct BoothConfig: Codable, Equatable, Sendable {
     public var reviewSeconds = 5.0
     public var shotsPerPress = 1
     var pauseBetweenShotsSeconds = 2.0
+    /// Each press takes exactly three photos (ignoring `shotsPerPress`), builds them into a strip
+    /// down the right of the TV, then prints a sheet automatically.
+    public var stripMode = false
+    /// Strip mode sends each finished sheet to the printer; false = render and save it only.
+    public var autoPrint = true
+    /// Queue photos for Google Photos (when signed in); false = save locally only.
+    public var upload = true
     var outputRoot = "~/PhotoBooth"
     public var albumName = "Photo Booth"
     public var display = DisplaySelection.auto
@@ -115,7 +122,8 @@ public struct BoothConfig: Codable, Equatable, Sendable {
 
     enum CodingKeys: String, CodingKey, CaseIterable {
         case eventName, buttonKey, buttonInput, buttonDevice, debounceMs, countdownSeconds
-        case reviewSeconds, shotsPerPress, pauseBetweenShotsSeconds, outputRoot, albumName
+        case reviewSeconds, shotsPerPress, pauseBetweenShotsSeconds, stripMode, autoPrint, upload
+        case outputRoot, albumName
         case display, mirrorPreview, idlePrompt, lighting, profiles
         case printer, printMedia, printTemplate, printCaption
     }
@@ -140,6 +148,9 @@ public struct BoothConfig: Codable, Equatable, Sendable {
         reviewSeconds = try c.decodeIfPresent(Double.self, forKey: .reviewSeconds) ?? d.reviewSeconds
         shotsPerPress = try c.decodeIfPresent(Int.self, forKey: .shotsPerPress) ?? d.shotsPerPress
         pauseBetweenShotsSeconds = try c.decodeIfPresent(Double.self, forKey: .pauseBetweenShotsSeconds) ?? d.pauseBetweenShotsSeconds
+        stripMode = try c.decodeIfPresent(Bool.self, forKey: .stripMode) ?? d.stripMode
+        autoPrint = try c.decodeIfPresent(Bool.self, forKey: .autoPrint) ?? d.autoPrint
+        upload = try c.decodeIfPresent(Bool.self, forKey: .upload) ?? d.upload
         outputRoot = try c.decodeIfPresent(String.self, forKey: .outputRoot) ?? d.outputRoot
         albumName = try c.decodeIfPresent(String.self, forKey: .albumName) ?? d.albumName
         display = try c.decodeIfPresent(DisplaySelection.self, forKey: .display) ?? d.display
@@ -166,6 +177,9 @@ public struct BoothConfig: Codable, Equatable, Sendable {
         try c.encode(reviewSeconds, forKey: .reviewSeconds)
         try c.encode(shotsPerPress, forKey: .shotsPerPress)
         try c.encode(pauseBetweenShotsSeconds, forKey: .pauseBetweenShotsSeconds)
+        try c.encode(stripMode, forKey: .stripMode)
+        try c.encode(autoPrint, forKey: .autoPrint)
+        try c.encode(upload, forKey: .upload)
         try c.encode(outputRoot, forKey: .outputRoot)
         try c.encode(albumName, forKey: .albumName)
         try c.encode(display, forKey: .display)

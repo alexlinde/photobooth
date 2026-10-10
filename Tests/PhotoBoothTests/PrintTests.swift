@@ -91,7 +91,42 @@ private func tempDir() -> URL {
     #expect(abs(tall.width - 504) < 0.01 && tall.height > 336)
 }
 
+@Test func stripColumnGeometryFollowsTheLayout() {
+    // A 1080-point-tall strip column on the TV.
+    let h: CGFloat = 1080
+    let k = h / 148
+    #expect(PrintLayout.stripSize(height: h) == CGSize(width: 50 * k, height: h))
+    #expect(abs(PrintLayout.stripSize(height: h).width - 364.86) < 0.01)
+    for (i, mm) in PrintLayout.photoWindowsMM.enumerated() {
+        let r = PrintLayout.stripWindow(i, height: h)
+        #expect(r == CGRect(x: mm.minX * k, y: mm.minY * k, width: mm.width * k, height: mm.height * k))
+        #expect(abs(r.width / r.height - 1.5) < 0.0001)
+    }
+    #expect(PrintLayout.stripWindow(0, height: h) == CGRect(x: 4 * k, y: 4 * k, width: 42 * k, height: 28 * k))
+    #expect(PrintLayout.stripWindow(2, height: h).minY == 66 * k)
+    // At the print's own height it's exactly the sheet's left strip.
+    let printHeight = PrintLayout.stripRect(0).height
+    for i in 0..<PrintLayout.photosPerStrip {
+        #expect(PrintLayout.stripWindow(i, height: printHeight) == PrintLayout.photoWindow(strip: 0, i))
+    }
+    #expect(PrintLayout.stripPoints(PrintLayout.captionAreaMM, height: printHeight) == PrintLayout.captionArea(strip: 0))
+}
+
 // MARK: - Rendering
+
+@Test func singleStripMatchesTheSheetsLeftHalf() throws {
+    let red = solid(1, 0, 0), green = solid(0, 1, 0)
+    let strip = try #require(PrintSheet.renderStrip(photos: [red, nil, green], artwork: nil, caption: "Anna"))
+    #expect(strip.width == 600 && strip.height == 1776)
+    let sheet = try #require(PrintSheet.render(photos: [red, nil, green], artwork: nil, caption: "Anna"))
+    let a = Pixels(strip), b = Pixels(sheet)
+    for y in stride(from: 0, to: 1776, by: 37) {
+        for x in stride(from: 0, to: 600, by: 23) {
+            let p = CGPoint(x: x, y: y)
+            #expect(near(a[p], b[p], tolerance: 2), "\(p): \(a[p]) vs \(b[p])")
+        }
+    }
+}
 
 @Test func photosLandInTheirWindowsOnBothStrips() throws {
     let red = solid(1, 0, 0), green = solid(0, 1, 0), blue = solid(0, 0, 1)

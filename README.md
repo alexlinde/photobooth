@@ -3,15 +3,18 @@
 A native macOS photo booth. A Sony ZV-E10 shows a mirrored live preview on a TV; a guest presses a big
 button, gets a 3-2-1 countdown, the camera fires (with strobes), and the photo is shown for a few seconds.
 Every photo is saved locally first and, optionally, uploaded to a shared Google Photos album. The attendant
-can print photo strips on a Canon SELPHY.
+can print photo strips on a Canon SELPHY, or in [strip mode](#strip-mode) each press takes three photos and prints
+the strip by itself.
 Design notes and rationale are in `SPEC.md`.
 
 ## Hardware
 
-- Sony ZV-E10 with SEL1855 kit lens (~24-28 mm used)
+- Sony ZV-E10 with SEL1855 kit lens (zoomed fully out to 18 mm; the zoom is manual)
 - NP-FW50 dummy battery (AC power; no battery swaps mid-event)
 - USB-C cable camera to Mac (control only; live view and photos come over USB)
-- Strobes fired by a radio trigger on the camera hot shoe
+- Two Flashpoint Studio 300 R2 strobes (mains powered, built-in R2 receivers), fired by a Flashpoint R2 TTL
+  transmitter for Sony (a Godox X1T-S) on the camera hot shoe. See [Strobe setup](#strobe-setup)
+- Canon SELPHY CP910 dye-sub printer (AirPrint over Wi-Fi), 100 x 148 mm KP-108IN paper. See [Printing](#printing)
 - TV on HDMI as an external display
 - H-Mod StealthSwitch 3 with a big arcade button on **port 1** (USB VID `0x1324` / PID `0x0103`;
   presents as keyboard + mouse)
@@ -43,6 +46,21 @@ can only wait for it to come back (it reconnects automatically once the camera i
 USB identification: the ZV-E10 in PC Remote mode has USB product ID `0x0d97`. Check with
 `system_profiler SPUSBHostDataType`. When the camera is off or not in PC Remote mode it shows up as
 "USB Charger".
+
+### Strobe setup
+
+Settled in a test session (black backdrop, balloon arch, guests about 2 m from the camera):
+
+- Transmitter and both strobes on the **same channel**, strobes in **group A**.
+- Group A in **Manual (M) at 1/2 power**, not TTL. TTL meters the mostly black frame and overexposes faces by
+  varying amounts, and its pre-flash makes people blink. At a fixed power every strip comes out the same, and the
+  strobes recycle in time for the next shot.
+- Camera profile `strobes` with **ISO 200** (`"profiles": {"strobes": {"iso": 200}}`): 1/160 s, f/8.
+- **Transmitter in single contact mode** (hold CH 2 s until Fn, dial to **C.Fn-01**, GR, dial to **1**, GR,
+  MODE to exit; a single-contact icon shows). In this mode it never enters power saving. Otherwise, after a couple
+  of idle minutes, the first flash only wakes the transmitter and that photo comes out black. The booth's USB
+  half-press does not wake it. Single contact mode gives up TTL, which the booth doesn't use.
+- Quick check: the transmitter's TEST button should fire both strobes.
 
 ## Build and install
 
@@ -99,6 +117,7 @@ Config lives at `~/PhotoBooth/config.json` and is created with defaults on first
 ```json
 {
   "albumName" : "Photo Booth",
+  "autoPrint" : true,
   "buttonDevice" : {
     "productID" : "0x0103",
     "vendorID" : "0x1324"
@@ -119,7 +138,9 @@ Config lives at `~/PhotoBooth/config.json` and is created with defaults on first
   "printer" : "",
   "reviewSeconds" : 5,
   "lighting" : "strobes",
-  "shotsPerPress" : 1
+  "shotsPerPress" : 1,
+  "stripMode" : false,
+  "upload" : true
 }
 ```
 
@@ -133,6 +154,9 @@ Config lives at `~/PhotoBooth/config.json` and is created with defaults on first
 | `countdownSeconds` | 0-10 |
 | `reviewSeconds` | How long the photo is shown (1-60) |
 | `shotsPerPress` | Photos per press (1-10); `pauseBetweenShotsSeconds` (0-30) between them |
+| `stripMode` | `true`: each press takes exactly three photos (`shotsPerPress` is ignored), builds the strip down the right of the TV, and prints it. See [Strip mode](#strip-mode) |
+| `autoPrint` | Strip mode only. `false`: render and save each sheet to `prints/` but don't send it to the printer (the TV says "Your strip is saved"). Handy while setting up |
+| `upload` | `false`: save photos locally only, no Google Photos queue. Turning it back on uploads every photo in the event folder that wasn't uploaded yet, so use a separate `eventName` for setup shots |
 | `outputRoot` | Root folder for photos, logs, `google_client.json`, upload state |
 | `albumName` | Google Photos album title |
 | `display` | `"auto"` (external display if present, else main), `"main"`, an integer index, or a case-insensitive part of the display name (e.g. `"LG"`) |
@@ -243,7 +267,8 @@ client is what makes the albums "app-created" for both Macs, so each can list an
 ## Printing
 
 Photo strips print on a **Canon SELPHY CP910** (dye-sub, 100 x 148 mm postcard paper, about a minute per
-sheet). Printing is never automatic: the attendant picks three photos and presses Print.
+sheet). Normally the attendant picks three photos and presses Print; in [strip mode](#strip-mode) every press
+prints its own strip.
 
 **Add the printer once:** put the SELPHY on the same Wi-Fi as the Mac, then System Settings -> Printers &
 Scanners -> **Add Printer** and pick it (it's found as AirPrint, no driver needed). macOS names the queue
@@ -256,9 +281,10 @@ like the control panel:
   strip, top to bottom. Click again to un-pick (the rest renumber). **Last 3** picks the three newest, oldest first
   (one press with `shotsPerPress` 3). **Clear** starts over.
 - Right: a preview of the sheet, **Copies** (1-5 sheets), and **Print** (enabled with three photos picked). After
-  sending, the selection clears and it says "Sent to printer".
+  sending, the selection clears and it says "Sent to printer". **Reprint last** sends the newest sheet in `prints/`
+  again (Copies times), e.g. after a misfeed or for a second copy of a strip-mode print.
 - Printer: the queue picker (saved to config.json), the printer's status, and its job queue with **Cancel** per job.
-  Status is checked every 3 s while the window is open. "Out of paper or a sheet didn't feed" means reload the
+  Status is checked every 3 s while the window is open (all the time in strip mode). "Out of paper or a sheet didn't feed" means reload the
   paper cassette; the print continues by itself. "Printer not reachable" means it's off or on another network.
 
 Each sheet is rendered to `~/PhotoBooth/<event>/prints/print-YYYYMMDD-HHMMSS.jpg` first, then sent with
@@ -275,6 +301,31 @@ frame are trimmed). Sheets are rendered at 12 px/mm (1200 x 1776 px).
 with a warning in the print window. Without artwork the strips are white with the caption (`printCaption`, else the
 event name) centred under the photos. Designing it: [docs/print-template.md](docs/print-template.md), starting from
 `templates/print-strip-template.svg` / `.png`.
+
+### Strip mode
+
+With `"stripMode": true` (or **Strip mode** in the control panel's Booth section) each press takes exactly three
+photos and prints them as a sheet (two identical strips, one copy), with no attendant involved:
+
+- The TV shows the strip as it will print in a column down the right, the full height of the screen: the same
+  artwork or caption and the same photo windows as the print. Empty windows show their number 1-3; the one being
+  taken is highlighted. The live preview, countdown, flash and "Oops" fill the rest of the screen.
+- After each photo it's shown for a moment (up to 2.5 s, or `reviewSeconds` if shorter), then shrinks into its window
+  on the strip, cropped as it will print. The next countdown starts as soon as it lands (no
+  `pauseBetweenShotsSeconds`).
+- After the third, the finished strip fills the screen with "Printing your strip…" for `reviewSeconds`, then the
+  booth is ready for the next guest with an empty strip.
+- The sheet is rendered in the background, saved to `prints/` like any other, and sent to the printer. If there's
+  no printer or `lp` fails, the TV says "Your strip is saved — ask the attendant for your print" instead, and the
+  control panel shows why (reprint it from the print window). A job waiting for paper or ink counts as sent: it
+  prints once the attendant fixes the printer.
+- A failed shot shows "Oops" and that photo is taken again (3 failures in a row still bring up the attendant
+  screen). Pausing the booth or losing the camera mid-strip abandons it: nothing prints, and the photos taken so far
+  stay saved in the event folder.
+- The control panel's Status shows the printer (with the queue length) and what happened to the last strip; the
+  printer is checked every 3 s while strip mode is on.
+
+About a minute per sheet, so with a busy booth the queue grows; CUPS keeps it in order.
 
 **Paper tips:**
 - Fan the sheets before loading; paper that has sat in the cassette sticks together and doesn't feed.
@@ -311,10 +362,12 @@ Open with **⌘,**, or by clicking PhotoBooth's Dock icon. Closing it doesn't qu
   refused and why), what the camera reports (mode, shutter, aperture, ISO, flash, focus, battery), button
   (connected, HID or focused-window fallback, seized or not), uploads (done / pending / failed, offline, last
   error), Google Photos sign-in (**Sign in…** runs the same browser flow as `--google-login`, then retries the
-  queue). An attendant issue shows here with a **Reset** button.
+  queue), the printer (in strip mode, or while the print window is open) and the last strip's print. An attendant
+  issue shows here with a **Reset** button.
 - **Lighting:** Strobes / Ambient / Don't change camera, with a disclosure to edit the selected profile's fields
   (choosing the built-in value removes the override).
-- **Booth:** event name, album, countdown, review time, photos per press, idle prompt, mirror preview.
+- **Booth:** event name, album, countdown, review time, strip mode, photos per press (fixed at 3 in strip mode),
+  idle prompt, mirror preview.
 - **Apply & Save** (⌘S) validates, writes config.json and applies it the same way as Ctrl+Opt+Cmd+R.
   **Revert** discards edits. **Test shot** presses the button. **Pause booth** shows "Back in a moment" on the
   TV and ignores presses (a countdown is aborted; a photo already being taken is saved); **Resume** returns.
@@ -337,6 +390,8 @@ don't leave a text field focused. See `docs/stealthswitch3-protocol.md` for prog
 | 3-2-1 countdown | Presses are ignored. |
 | White flash | The shutter fired. |
 | Review ("Saved!") | The photo, not mirrored, for `reviewSeconds`; then back to idle. |
+| Strip down the right (strip mode) | The strip as it will print; each photo shrinks into its window after a short review. |
+| Finished strip, "Printing your strip…" (strip mode) | The sheet is on its way to the printer. "Ask the attendant for your print" means it couldn't be sent. |
 | "Oops - let's try that again" | A capture failed; returns to idle after a moment. |
 | **ATTENDANT NEEDED** | Repeated failures or a config / storage / permission problem. Fix it, then press Ctrl+Opt+Cmd+R (or Reset in the control panel). |
 | "Back in a moment" | Paused from the control panel; presses are ignored. |
@@ -374,11 +429,15 @@ Modules:
 - `PhotoBooth`: the SwiftUI/AppKit app (views, HID input, app delegate, upload wiring)
 - `BoothSpike`: hardware spike / soak CLI (`booth-spike`)
 
-`PhotoBooth` flags: `--windowed`, `--fake-camera`, `--fake-fail-rate X`, `--config PATH`, `--learn-key`,
+`PhotoBooth` flags: `--windowed`, `--fake-camera`, `--fake-fail-rate X`, `--print-fake`, `--config PATH`, `--learn-key`,
 `--google-login`, `--self-test` (runs the state-machine scenarios), `--auto-press SECONDS`,
 `--print-window-id`, `--snapshot-dir DIR` (PNGs of the booth window and the control panel after each state change,
 plus a full-height render of the panel), `--render-print A.jpg B.jpg C.jpg --out SHEET.jpg` (renders a print sheet
-with the configured artwork / caption and exits; prints nothing). Develop without hardware (booth and control panel as normal windows):
+with the configured artwork / caption and exits; prints nothing), `--render-strip-screen A.jpg B.jpg C.jpg --out DIR`
+(renders strip-mode TV frames at 1920 x 1080 into DIR: idle, countdown, review, mid fly-in and the finished strip),
+`--print-fake` (with `--fake-camera`: really print strip-mode sheets; without it fake strips are rendered and saved to
+`prints/` but not printed, and the log says "would print", to save paper). Develop without hardware (booth and
+control panel as normal windows):
 
 ```sh
 swift run PhotoBooth --windowed --fake-camera

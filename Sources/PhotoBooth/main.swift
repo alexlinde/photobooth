@@ -25,6 +25,10 @@ if let photos = options.renderPrint, let out = options.renderOut {
     exit(RenderPrint.run(photos: photos, out: out, configPath: options.configPath))
 }
 
+if let photos = options.renderStripScreen, let out = options.renderOut {
+    MainActor.assumeIsolated { exit(RenderStripScreen.run(photos: photos, outDir: out, configPath: options.configPath)) }
+}
+
 if options.googleLogin {
     Task { @MainActor in exit(await GoogleLogin.run(configPath: options.configPath)) }
     dispatchMain()

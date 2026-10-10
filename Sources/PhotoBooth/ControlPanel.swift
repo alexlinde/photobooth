@@ -24,6 +24,8 @@ final class ControlPanelModel {
     var button: ButtonInput.Status?
     /// nil with --fake-camera (fake photos are never uploaded).
     var uploads: UploadService?
+    /// The print window's model: printer status, and strip mode's last print.
+    var printing: PrintModel?
 
     /// The config in effect (last loaded or saved).
     private(set) var applied: BoothConfig
@@ -164,6 +166,8 @@ final class ControlPanelModel {
         case .capturing: return "Taking a photo"
         case .review: return "Showing the photo"
         case .betweenShots: return "Between photos"
+        case .flyIn: return "Adding the photo to the strip"
+        case .stripReview: return "Showing the finished strip"
         case .notice: return "Capture failed; retrying"
         case .attendant: return "Attendant needed"
         case .paused: return "Paused (TV shows “Back in a moment”)"
@@ -257,6 +261,21 @@ struct ControlPanelView: View {
                 StatusRow(title: "Keystrokes", text: s.0, color: s.1)
             }
             uploadStatus
+            printerStatus
+        }
+    }
+
+    /// The printer: always in strip mode, otherwise while the print window is polling it.
+    @ViewBuilder
+    private var printerStatus: some View {
+        if let pm = model.printing, model.applied.stripMode || pm.printer.polling {
+            let p = pm.printer
+            let a = p.attention
+            let queued = p.jobs.isEmpty ? "" : " · \(p.jobs.count) in queue"
+            StatusRow(title: "Printer", text: a.text + queued, color: PrintView.color(a.level))
+            if model.applied.stripMode, let s = pm.stripStatus {
+                StatusRow(title: "Last strip", text: s.text, color: s.isError ? .red : .secondary)
+            }
         }
     }
 
@@ -344,7 +363,8 @@ struct ControlPanelView: View {
                 StatusRow(title: "Uploads", text: "Off: no google_client.json (photos are saved locally)", color: .secondary)
             }
         } else {
-            StatusRow(title: "Uploads", text: "Off with --fake-camera (photos are saved locally)", color: .secondary)
+            StatusRow(title: "Uploads", text: model.applied.upload ? "Off with --fake-camera (photos are saved locally)"
+                                                    : "Off in settings (photos are saved locally)", color: .secondary)
         }
     }
 
@@ -469,7 +489,14 @@ struct ControlPanelView: View {
             albumPicker
             Stepper("Countdown: \(model.draft.countdownSeconds) s", value: $model.draft.countdownSeconds, in: 0...10)
             Stepper("Review: \(Int(model.draft.reviewSeconds)) s", value: $model.draft.reviewSeconds, in: 1...60, step: 1)
-            Stepper("Photos per press: \(model.draft.shotsPerPress)", value: $model.draft.shotsPerPress, in: 1...10)
+            Toggle("Strip mode (3 photos, then print)", isOn: $model.draft.stripMode)
+            if model.draft.stripMode {
+                Toggle("Print strips automatically", isOn: $model.draft.autoPrint)
+            }
+            Toggle("Upload to Google Photos", isOn: $model.draft.upload)
+            Stepper(model.draft.stripMode ? "Photos per press: \(PrintLayout.photosPerStrip) (strip mode)" : "Photos per press: \(model.draft.shotsPerPress)",
+                    value: $model.draft.shotsPerPress, in: 1...10)
+                .disabled(model.draft.stripMode)
             TextField("Idle prompt", text: $model.draft.idlePrompt)
             Toggle("Mirror preview", isOn: $model.draft.mirrorPreview)
         } header: {

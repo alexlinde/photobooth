@@ -198,6 +198,8 @@ private let isPropPoll: (FakeCamera.Call) -> Bool = { $0.code == PTPOperation.so
     #expect(reportAtReady?.allOK == true)
     // All writes happened before live view started.
     let lastWrite = try #require(fake.calls.lastIndex { $0.code == PTPOperation.sonySetControlDeviceA })
+    // Live view starts just after ready; wait for it rather than racing it.
+    try await waitUntil("live view") { fake.calls.contains { $0.isLiveView } }
     let firstLV = try #require(fake.calls.firstIndex { $0.isLiveView })
     #expect(lastWrite < firstLV)
     #expect(camera.status.readout?.exposureMode == "M")

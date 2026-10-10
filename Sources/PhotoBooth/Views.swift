@@ -1,5 +1,6 @@
 import BoothCore
 import AppKit
+import ImageIO
 import QuartzCore
 import SwiftUI
 
@@ -70,37 +71,137 @@ struct BoothRootView: View {
     let controller: BoothController
     let preview: LivePreviewNSView
     let idlePrompt: String
+    var stripMode = false
+    /// Strip mode: one strip as printed (artwork or caption), drawn under the slots.
+    var stripBackground: CGImage?
 
     var body: some View {
-        GeometryReader { geo in
-            let h = max(geo.size.height, 240)
-            ZStack {
-                Color.black
-                LivePreview(view: preview)
-                overlay(h: h)
-                    .transition(.opacity)
-                VStack {
-                    Spacer()
-                    BannerStack(messages: banners, h: h)
-                }
-            }
-            .animation(.easeInOut(duration: 0.25), value: controller.state.label)
+        BoothScreen(state: controller.state, banners: banners, idlePrompt: idlePrompt,
+                    strip: stripMode ? StripScreen(background: stripBackground, photos: controller.stripPhotos,
+                                                   message: controller.stripMessage) : nil) {
+            LivePreview(view: preview)
         }
-        .ignoresSafeArea()
-        .preferredColorScheme(.dark)
     }
 
     private var banners: [String] {
         var b: [String] = []
         if let s = controller.buttonStatus { b.append(s) }
         if let s = controller.inputBanner { b.append(s) }
-        if case .review = controller.state { return [] }
-        return b
+        switch controller.state {
+        case .review, .stripReview: return []
+        default: return b
+        }
+    }
+}
+
+/// What strip mode adds to the TV: the strip column's artwork and photos so far, and the line
+/// under the finished strip.
+struct StripScreen {
+    var background: CGImage?
+    var photos: [ReviewPhoto]
+    /// nil = "Printing your strip…".
+    var message: String?
+}
+
+/// The TV for a given state. Without a strip it's the preview with the state's overlay on top.
+/// In strip mode the strip column (full height, the strip's true shape) sits on the right and
+/// the preview with its overlays fills the rest; waiting / attendant / paused and the finished
+/// strip cover the whole screen. Separate from `BoothRootView` so `--render-strip-screen` can
+/// draw it with a still image for the preview.
+struct BoothScreen<Preview: View>: View {
+    let state: BoothState
+    let banners: [String]
+    let idlePrompt: String
+    let strip: StripScreen?
+    let preview: Preview
+    /// `--render-strip-screen`: draw the fly-in frozen at this progress (0–1) instead of animating.
+    var flyInProgress: CGFloat?
+
+    init(state: BoothState, banners: [String], idlePrompt: String, strip: StripScreen?, @ViewBuilder preview: () -> Preview) {
+        self.state = state
+        self.banners = banners
+        self.idlePrompt = idlePrompt
+        self.strip = strip
+        self.preview = preview()
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            let h = max(geo.size.height, 240)
+            let stripWidth = strip == nil ? 0 : PrintLayout.stripSize(height: geo.size.height).width
+            let area = CGSize(width: max(0, geo.size.width - stripWidth), height: geo.size.height)
+            ZStack {
+                HStack(spacing: 0) {
+                    ZStack {
+                        Color.black
+                        preview
+                        if !coversScreen {
+                            overlay(h: h)
+                                .transition(.opacity)
+                            VStack {
+                                Spacer()
+                                BannerStack(messages: banners, h: h)
+                            }
+                        }
+                    }
+                    .frame(width: area.width, height: area.height)
+                    .clipped()
+                    if let strip {
+                        StripColumn(background: strip.background, photos: strip.photos, active: activeSlot, height: geo.size.height)
+                    }
+                }
+                if coversScreen {
+                    ZStack {
+                        overlay(h: h)
+                        VStack {
+                            Spacer()
+                            BannerStack(messages: banners, h: h)
+                        }
+                    }
+                    .transition(.opacity)
+                }
+                if case let .flyIn(photo, shot, _) = state, strip != nil {
+                    // From where the review showed it to its window on the strip column.
+                    let from = Self.fitRect(photo.image, in: CGRect(origin: .zero, size: area))
+                    let to = PrintLayout.stripWindow(shot - 1, height: geo.size.height).offsetBy(dx: area.width, dy: 0)
+                    FlyInView(image: photo.image, from: from, to: to, duration: BoothSettings.stripFlyInSeconds, progress: flyInProgress)
+                        .transition(.identity)
+                }
+            }
+            .animation(.easeInOut(duration: 0.25), value: state.label)
+        }
+        .ignoresSafeArea()
+        .preferredColorScheme(.dark)
+    }
+
+    /// Strip mode: states that take the whole screen, strip column included.
+    private var coversScreen: Bool {
+        guard strip != nil else { return false }
+        switch state {
+        case .waitingForCamera, .attendant, .paused, .stripReview: return true
+        default: return false
+        }
+    }
+
+    /// The slot (1-based) of the shot under way, highlighted on the strip column.
+    private var activeSlot: Int? {
+        switch state {
+        case let .countdown(_, shot, _), let .capturing(shot, _), let .review(_, shot, _), let .flyIn(_, shot, _): return shot
+        default: return nil
+        }
+    }
+
+    /// Where `ReviewView` shows the photo (aspect fit, centred).
+    static func fitRect(_ image: CGImage?, in r: CGRect) -> CGRect {
+        guard let image, image.width > 0, image.height > 0 else { return r }
+        let s = min(r.width / CGFloat(image.width), r.height / CGFloat(image.height))
+        let w = CGFloat(image.width) * s, h = CGFloat(image.height) * s
+        return CGRect(x: r.midX - w / 2, y: r.midY - h / 2, width: w, height: h)
     }
 
     @ViewBuilder
     private func overlay(h: CGFloat) -> some View {
-        switch controller.state {
+        switch state {
         case .idle:
             IdlePromptView(text: idlePrompt, h: h)
         case let .countdown(remaining, shot, n):
@@ -111,6 +212,10 @@ struct BoothRootView: View {
             ReviewView(photo: photo, shot: shot, of: n, h: h)
         case let .betweenShots(next, n):
             MessageView(text: "Get ready for photo \(next) of \(n)!", h: h, dim: 0.35)
+        case .flyIn:
+            EmptyView()  // the photo flies over the preview (above)
+        case let .stripReview(photos):
+            StripReviewView(background: strip?.background, photos: photos, message: strip?.message, h: h)
         case let .notice(text):
             MessageView(text: text, h: h, dim: 0.6)
         case let .waitingForCamera(status):
@@ -119,6 +224,152 @@ struct BoothRootView: View {
             AttendantView(issue: issue, h: h)
         case .paused:
             PausedView(h: h)
+        }
+    }
+}
+
+// MARK: - Strip mode
+
+/// The strip as it will print, `height` points tall: the strip artwork / caption (rendered by
+/// `PrintSheet`), and each window positioned from `PrintLayout`, so it can't drift from the print.
+struct StripColumn: View {
+    let background: CGImage?
+    let photos: [ReviewPhoto]
+    /// Highlighted slot, 1-based.
+    let active: Int?
+    let height: CGFloat
+
+    var body: some View {
+        let size = PrintLayout.stripSize(height: height)
+        ZStack {
+            if let background {
+                Image(decorative: background, scale: 1).resizable().interpolation(.high)
+            } else {
+                Color.white
+            }
+            ForEach(0..<PrintLayout.photosPerStrip, id: \.self) { k in
+                let r = PrintLayout.stripWindow(k, height: height)
+                StripSlot(number: k + 1, photo: k < photos.count ? photos[k] : nil, active: active == k + 1, h: r.height)
+                    .frame(width: r.width, height: r.height)
+                    .position(x: r.midX, y: r.midY)
+            }
+        }
+        .frame(width: size.width, height: size.height)
+    }
+}
+
+/// A window on the strip: the photo, or a soft placeholder with its number.
+struct StripSlot: View {
+    let number: Int
+    let photo: ReviewPhoto?
+    let active: Bool
+    let h: CGFloat
+
+    static let highlight = Color(red: 1, green: 0.8, blue: 0.3)
+
+    var body: some View {
+        ZStack {
+            if let photo {
+                // No transition: it replaces the landing fly-in photo in the same frame.
+                StripPhoto(image: photo.image)
+                    .transition(.identity)
+            } else {
+                ZStack {
+                    Color(white: active ? 0.97 : 0.92)
+                    Text("\(number)")
+                        .font(.booth(h * 0.62, .black))
+                        .foregroundStyle(active ? Self.highlight : Color(white: 0.74))
+                }
+                .transition(.identity)
+            }
+        }
+        .overlay {
+            if active && photo == nil {
+                Rectangle()
+                    .stroke(Self.highlight, lineWidth: max(2, h * 0.035))
+                    .shadow(color: Self.highlight.opacity(0.7), radius: h * 0.08)
+            }
+        }
+        .animation(.easeInOut(duration: 0.3), value: active)
+    }
+}
+
+/// A photo cropped into a window like the print: aspect fill, centred, clipped to the frame it's
+/// given.
+struct StripPhoto: View {
+    let image: CGImage?
+    var body: some View {
+        Color(white: 0.35)
+            .overlay {
+                if let image {
+                    Image(decorative: image, scale: 1)
+                        .resizable()
+                        .interpolation(.high)
+                        .aspectRatio(contentMode: .fill)
+                }
+            }
+            .clipped()
+    }
+}
+
+/// The reviewed photo shrinking from `from` (where the review showed it) into its window `to`,
+/// cropping to the window's 3:2 as it goes.
+struct FlyInView: View {
+    let image: CGImage?
+    let from: CGRect
+    let to: CGRect
+    let duration: Double
+    /// Frozen at this point of the flight (dev renders); nil = animate.
+    var progress: CGFloat?
+    @State private var landed = false
+
+    var body: some View {
+        if let t = progress {
+            FlyingPhoto(image: image, rect: Self.lerp(from, to, t))
+        } else {
+            FlyingPhoto(image: image, rect: landed ? to : from)
+                .onAppear { withAnimation(.easeInOut(duration: duration)) { landed = true } }
+        }
+    }
+
+    static func lerp(_ a: CGRect, _ b: CGRect, _ t: CGFloat) -> CGRect {
+        CGRect(x: a.minX + (b.minX - a.minX) * t, y: a.minY + (b.minY - a.minY) * t,
+               width: a.width + (b.width - a.width) * t, height: a.height + (b.height - a.height) * t)
+    }
+}
+
+struct FlyingPhoto: View {
+    let image: CGImage?
+    let rect: CGRect
+    var body: some View {
+        StripPhoto(image: image)
+            .frame(width: rect.width, height: rect.height)
+            .clipped()
+            .shadow(color: .black.opacity(0.5), radius: 12)
+            .position(x: rect.midX, y: rect.midY)
+    }
+}
+
+/// After the third photo: the whole strip, large, while it prints.
+struct StripReviewView: View {
+    let background: CGImage?
+    let photos: [ReviewPhoto]
+    let message: String?
+    let h: CGFloat
+
+    var body: some View {
+        ZStack {
+            LinearGradient(colors: [Color(red: 0.1, green: 0.1, blue: 0.16), .black], startPoint: .top, endPoint: .bottom)
+            VStack(spacing: h * 0.03) {
+                StripColumn(background: background, photos: photos, active: nil, height: h * 0.8)
+                    .compositingGroup()
+                    .shadow(color: .black.opacity(0.6), radius: h * 0.025)
+                Text(message ?? "Printing your strip…")
+                    .font(.booth(h * 0.045, .bold))
+                    .foregroundStyle(.white)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, h * 0.06)
+            }
         }
     }
 }
@@ -340,6 +591,55 @@ struct BannerStack: View {
             }
         }
         .padding(.bottom, h * 0.015)
+    }
+}
+
+/// `PhotoBooth --render-strip-screen a.jpg b.jpg c.jpg --out DIR`: renders strip-mode TV frames at
+/// 1920 x 1080 with the configured artwork / caption (a still photo, mirrored, stands in for the
+/// live preview) and exits. No camera, nothing printed.
+@MainActor
+enum RenderStripScreen {
+    static func run(photos: [String], outDir: String, configPath: String?) -> Int32 {
+        let (config, error) = ConfigLoader.load(path: configPath)
+        if let error { print("config: \(error.description) (continuing with defaults)") }
+        let art = PrintSheet.loadArtwork(config.printTemplateURL)
+        if let w = art.warning { print("warning: \(w)") }
+        let background = PrintSheet.renderStrip(photos: [], artwork: art.image, caption: config.printCaptionText)
+        let urls = photos.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
+        let shots = urls.map { ReviewPhoto(url: $0, image: PrintSheet.loadPhoto($0, maxPixel: 1920)) }
+        guard shots.allSatisfy({ $0.image != nil }) else { print("Couldn't read the photos."); return 1 }
+        let dir = URL(fileURLWithPath: (outDir as NSString).expandingTildeInPath, isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+
+        let two = Array(shots.prefix(2))
+        let frames: [(String, BoothState, [ReviewPhoto], CGFloat?)] = [
+            ("strip-idle", .idle, [], nil),
+            ("strip-screen", .countdown(remaining: 2, shot: 3, of: 3), two, nil),
+            ("strip-review", .review(shots[2], shot: 3, of: 3), two, nil),
+            ("strip-flyin", .flyIn(shots[2], shot: 3, of: 3), two, 0.5),
+            ("strip-final", .stripReview(shots), shots, nil),
+        ]
+        for (name, state, filled, progress) in frames {
+            var screen = BoothScreen(state: state, banners: [], idlePrompt: config.idlePrompt,
+                                     strip: StripScreen(background: background, photos: filled, message: nil)) {
+                // Sized by its frame like the real (layer-backed) preview.
+                StripPhoto(image: shots[2].image)
+                    .scaleEffect(x: config.mirrorPreview ? -1 : 1, y: 1)
+            }
+            screen.flyInProgress = progress
+            let renderer = ImageRenderer(content: screen.frame(width: 1920, height: 1080))
+            renderer.scale = 1
+            let url = dir.appendingPathComponent(name + ".png")
+            guard let image = renderer.cgImage,
+                  let dest = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil) else {
+                print("Couldn't render \(name).")
+                return 1
+            }
+            CGImageDestinationAddImage(dest, image, nil)
+            guard CGImageDestinationFinalize(dest) else { print("Couldn't write \(url.path)."); return 1 }
+            print("Wrote \(url.path)")
+        }
+        return 0
     }
 }
 

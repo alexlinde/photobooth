@@ -9,6 +9,8 @@ public struct BoothSettings: Equatable, Sendable {
     var reviewSeconds = 5.0
     var shotsPerPress = 1
     var pauseBetweenShotsSeconds = 2.0
+    /// Three photos per press, built into a strip and printed (`shotsPerPress` is ignored).
+    var stripMode = false
     var debounceSeconds = 0.4
     /// How long the "Oops" message stays up after a failed capture.
     var noticeSeconds = 3.0
@@ -24,8 +26,17 @@ public struct BoothSettings: Equatable, Sendable {
         reviewSeconds = c.reviewSeconds
         shotsPerPress = c.shotsPerPress
         pauseBetweenShotsSeconds = c.pauseBetweenShotsSeconds
+        stripMode = c.stripMode
         debounceSeconds = c.debounce
     }
+
+    /// Strip mode: each photo's full-screen review (at most `reviewSeconds`) before it flies
+    /// into its slot. No pause between shots: the review and the fly-in are the breather.
+    public static let stripShotReviewSeconds = 2.5
+    /// Strip mode: how long the photo takes to fly from the review into its slot on the strip.
+    public static let stripFlyInSeconds = 0.8
+
+    var shotReviewSeconds: Double { stripMode ? min(reviewSeconds, Self.stripShotReviewSeconds) : reviewSeconds }
 }
 
 /// Why the attendant is needed.
@@ -70,6 +81,11 @@ public struct ReviewPhoto: Equatable, @unchecked Sendable {
     /// Downsampled to screen size off the main thread (nil if decoding failed).
     public let image: CGImage?
     public static func == (a: ReviewPhoto, b: ReviewPhoto) -> Bool { a.id == b.id }
+
+    public init(url: URL, image: CGImage?) {
+        self.url = url
+        self.image = image
+    }
 }
 
 public enum BoothState: Equatable {
@@ -78,8 +94,12 @@ public enum BoothState: Equatable {
     case countdown(remaining: Int, shot: Int, of: Int)
     case capturing(shot: Int, of: Int)
     case review(ReviewPhoto, shot: Int, of: Int)
-    /// Pause between shots of a multi-shot press.
+    /// Pause between shots of a multi-shot press (not in strip mode).
     case betweenShots(next: Int, of: Int)
+    /// Strip mode: the reviewed photo shrinks into its slot on the strip (`stripFlyInSeconds`).
+    case flyIn(ReviewPhoto, shot: Int, of: Int)
+    /// Strip mode: the finished strip, large, while it prints (`reviewSeconds`).
+    case stripReview([ReviewPhoto])
     /// Brief friendly message (e.g. after a failed capture), then back to idle.
     case notice(String)
     case attendant(AttendantIssue)
@@ -95,6 +115,8 @@ public enum BoothState: Equatable {
         case let .capturing(k, n): return "capturing(\(k)/\(n))"
         case let .review(_, k, n): return "review(\(k)/\(n))"
         case let .betweenShots(k, n): return "between(\(k)/\(n))"
+        case let .flyIn(_, k, n): return "flyin(\(k)/\(n))"
+        case .stripReview: return "strip-review"
         case .notice: return "notice"
         case .attendant(let i): return "attendant(\(i.kind))"
         case .paused: return "paused"
@@ -125,10 +147,19 @@ public final class BoothController {
     /// Paused from the control panel. While paused the state is `.paused` (except while a
     /// capture already in flight finishes and saves).
     public private(set) var isPaused = false
+    /// Strip mode: the photos taken so far this press, in slot order (top first). Cleared when the
+    /// session ends or is aborted (the files stay saved).
+    public private(set) var stripPhotos: [ReviewPhoto] = []
+    /// Strip mode: replaces "Printing your strip…" under the finished strip (set by the app when
+    /// it can't print). Cleared at the start of each press.
+    public var stripMessage: String?
 
     @ObservationIgnored public var settings: BoothSettings
     @ObservationIgnored public var sink: PhotoSink
     @ObservationIgnored public var onStateChange: ((BoothState) -> Void)?
+    /// Strip mode: called once per finished strip with its three saved photos, top to bottom.
+    /// The app renders and prints the sheet; an aborted strip never gets here.
+    @ObservationIgnored public var onStripComplete: (([URL]) -> Void)?
 
     @ObservationIgnored private let camera: BoothCamera
     @ObservationIgnored private let clock: BoothClock
@@ -198,7 +229,8 @@ public final class BoothController {
             set(.waitingForCamera(status: Self.statusText(camera.state)))
             return .ignored("camera not ready")
         }
-        BoothLog.info(.booth, "Button pressed: starting \(settings.shotsPerPress)-shot session")
+        BoothLog.info(.booth, settings.stripMode ? "Button pressed: starting a strip (\(PrintLayout.photosPerStrip) shots)"
+                                                 : "Button pressed: starting \(settings.shotsPerPress)-shot session")
         sessionID += 1
         let id = sessionID
         sessionTask = Task { [weak self] in await self?.runSession(id: id) }
@@ -215,7 +247,7 @@ public final class BoothController {
         switch state {
         case .capturing:
             break // runSession saves the photo, then lands on .paused via returnToIdle().
-        case .countdown, .betweenShots, .review, .notice:
+        case .countdown, .betweenShots, .review, .flyIn, .stripReview, .notice:
             abortSession()
             set(.paused)
         case .attendant(let issue):
@@ -274,7 +306,7 @@ public final class BoothController {
     /// Ignored mid-session; the caller may retry later.
     public func raiseAttendant(_ issue: AttendantIssue) {
         switch state {
-        case .countdown, .capturing, .review, .betweenShots:
+        case .countdown, .capturing, .review, .betweenShots, .flyIn, .stripReview:
             BoothLog.info(.booth, "Deferring attendant (\(issue.kind)) until session ends")
             pendingAttendant = issue
             return
@@ -310,7 +342,7 @@ public final class BoothController {
                 abortSession()
                 set(.waitingForCamera(status: Self.statusText(s)))
             }
-        case .capturing, .review, .notice:
+        case .capturing, .review, .flyIn, .stripReview, .notice:
             break // finishes on its own; returnToIdle() checks readiness.
         case .attendant(let issue):
             if !s.isReady { cameraDroppedSinceAttendant = true }
@@ -339,6 +371,7 @@ public final class BoothController {
     private func isCurrent(_ id: Int) -> Bool { id == sessionID && !Task.isCancelled }
 
     private func abortSession() {
+        discardStrip()
         sessionID += 1
         sessionTask?.cancel()
         sessionTask = nil
@@ -349,15 +382,22 @@ public final class BoothController {
     }
 
     private func runSession(id: Int) async {
-        let n = max(1, settings.shotsPerPress)
+        let strip = settings.stripMode
+        let n = strip ? PrintLayout.photosPerStrip : max(1, settings.shotsPerPress)
+        stripPhotos = []
+        stripMessage = nil
         do {
-            for shot in 1...n {
-                if shot > 1 {
+            var shot = 1
+            // Strip mode retries a failed shot (after the "Oops" notice) instead of ending the press.
+            var retrying = false
+            while shot <= n {
+                if shot > 1, !strip, !retrying {
                     set(.betweenShots(next: shot, of: n))
                     try await clock.sleep(seconds: settings.pauseBetweenShotsSeconds)
                     guard isCurrent(id) else { return }
                     guard camera.state.isReady else { returnToIdle(); return }
                 }
+                retrying = false
                 // Countdown, with half-press at its start so AF has settled at the end.
                 prepareOutstanding = true
                 let prepare = Task { await camera.prepareCapture() }
@@ -376,7 +416,10 @@ public final class BoothController {
                     photo = try await camera.capture()
                 } catch {
                     guard id == sessionID else { return }
-                    await captureFailed(error, id: id)
+                    if await captureFailed(error, id: id, retry: strip) {
+                        retrying = true
+                        continue
+                    }
                     return
                 }
                 guard id == sessionID else { return }
@@ -408,9 +451,28 @@ public final class BoothController {
                 }
                 let image = await decodeTask.value
                 guard id == sessionID else { return }
-                set(.review(ReviewPhoto(url: url, image: image), shot: shot, of: n))
-                try await clock.sleep(seconds: settings.reviewSeconds)
+                let review = ReviewPhoto(url: url, image: image)
+                set(.review(review, shot: shot, of: n))
+                try await clock.sleep(seconds: settings.shotReviewSeconds)
                 guard isCurrent(id) else { return }
+                if strip {
+                    set(.flyIn(review, shot: shot, of: n))
+                    try await clock.sleep(seconds: BoothSettings.stripFlyInSeconds)
+                    guard isCurrent(id) else { return }
+                    // Landed: the slot takes over from the flying photo in the same update.
+                    stripPhotos.append(review)
+                    if shot == n {
+                        BoothLog.info(.booth, "Strip complete: \(stripPhotos.map(\.url.lastPathComponent))")
+                        set(.stripReview(stripPhotos))
+                        onStripComplete?(stripPhotos.map(\.url))
+                        try await clock.sleep(seconds: settings.reviewSeconds)
+                        guard isCurrent(id) else { return }
+                    } else if !camera.state.isReady {
+                        returnToIdle()  // camera lost during the review: the strip is abandoned
+                        return
+                    }
+                }
+                shot += 1
             }
             returnToIdle()
         } catch {
@@ -419,22 +481,38 @@ public final class BoothController {
         }
     }
 
-    private func captureFailed(_ error: Error, id: Int) async {
+    /// Returns true when the session should try the same shot again (strip mode, after the
+    /// notice); otherwise the session is over (idle, paused or attendant).
+    private func captureFailed(_ error: Error, id: Int, retry: Bool) async -> Bool {
         let cameraOK = camera.state.isReady
         if cameraOK { consecutiveFailures += 1 }
         BoothLog.error(.camera, "Capture failed (\(consecutiveFailures) in a row, camera \(camera.state)): \(error)")
         if isPaused, consecutiveFailures < settings.maxConsecutiveFailures {
             returnToIdle()
-            return
+            return false
         }
         if consecutiveFailures >= settings.maxConsecutiveFailures {
             enterAttendant(.captureFailures("\(consecutiveFailures) photos in a row failed. Last error: \(Self.describe(error)). Check the camera (battery, memory card, lens cap, settings)."))
-            return
+            return false
         }
         set(.notice("Oops — let's try that again"))
-        do { try await clock.sleep(seconds: settings.noticeSeconds) } catch { return }
-        guard id == sessionID else { return }
+        do { try await clock.sleep(seconds: settings.noticeSeconds) } catch { return false }
+        guard id == sessionID else { return false }
+        if retry, case .notice = state, !isPaused, camera.state.isReady {
+            BoothLog.info(.booth, "Retrying the shot")
+            return true
+        }
         returnToIdle()
+        return false
+    }
+
+    /// Strip mode: forget the photos taken so far (the files stay saved; nothing prints).
+    private func discardStrip() {
+        guard !stripPhotos.isEmpty else { return }
+        if case .stripReview = state {} else {
+            BoothLog.info(.booth, "Strip abandoned with \(stripPhotos.count) of \(PrintLayout.photosPerStrip) photos (they stay saved)")
+        }
+        stripPhotos = []
     }
 
     // MARK: Attendant / storage
@@ -447,6 +525,7 @@ public final class BoothController {
             set(.paused)
             return
         }
+        discardStrip()
         cameraDroppedSinceAttendant = false
         set(.attendant(issue))
         if case .storage = issue { scheduleStorageRetry() }
@@ -490,6 +569,7 @@ public final class BoothController {
     }
 
     private func returnToIdle() {
+        discardStrip()
         if isPaused {
             set(.paused)
             return

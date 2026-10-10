@@ -44,6 +44,22 @@ public enum PrintLayout {
         px(captionAreaMM.offsetBy(dx: CGFloat(i) * stripMM.width, dy: 0), scale)
     }
 
+    /// One strip drawn `height` points tall (the booth TV's strip column), in points.
+    public static func stripSize(height: CGFloat) -> CGSize {
+        CGSize(width: stripMM.width * height / stripMM.height, height: height)
+    }
+
+    /// A strip-local rect in mm, in points for a strip drawn `height` tall (top-left origin).
+    public static func stripPoints(_ mm: CGRect, height: CGFloat) -> CGRect {
+        let k = height / stripMM.height
+        return CGRect(x: mm.minX * k, y: mm.minY * k, width: mm.width * k, height: mm.height * k)
+    }
+
+    /// Photo window `k` in a strip drawn `height` points tall.
+    public static func stripWindow(_ k: Int, height: CGFloat) -> CGRect {
+        stripPoints(photoWindowsMM[k], height: height)
+    }
+
     static func px(_ mm: CGRect, _ scale: CGFloat) -> CGRect {
         let k = pixelsPerMM * scale
         return CGRect(x: mm.minX * k, y: mm.minY * k, width: mm.width * k, height: mm.height * k)
@@ -141,27 +157,51 @@ public enum PrintSheet {
         ctx.setFillColor(gray: 1, alpha: 1)
         ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
         for i in 0..<PrintLayout.stripCount {
-            if let artwork {
-                ctx.draw(artwork, in: flip(PrintLayout.stripRect(i, scale: scale)))
-            } else {
-                let area = PrintLayout.captionArea(strip: i, scale: scale)
-                let inset = PrintLayout.captionInsetMM * PrintLayout.pixelsPerMM * scale
-                drawCaption(caption, in: flip(area.insetBy(dx: inset, dy: inset)), scale: scale, ctx)
-            }
-            for k in 0..<PrintLayout.photosPerStrip {
-                let window = flip(PrintLayout.photoWindow(strip: i, k, scale: scale))
-                if k < photos.count, let photo = photos[k] {
-                    ctx.saveGState()
-                    ctx.clip(to: window)
-                    ctx.draw(photo, in: PrintLayout.aspectFill(CGSize(width: photo.width, height: photo.height), in: window))
-                    ctx.restoreGState()
-                } else {
-                    ctx.setFillColor(gray: placeholderGray, alpha: 1)
-                    ctx.fill(window)
-                }
-            }
+            drawStrip(i, photos: photos, artwork: artwork, caption: caption, scale: scale, ctx, flip)
         }
         return ctx.makeImage()
+    }
+
+    /// Renders one strip at `scale` (1 = 600 x 1776 px), exactly as each half of the sheet. The
+    /// booth TV's strip column draws it (without photos) under its slots.
+    public static func renderStrip(photos: [CGImage?], artwork: CGImage?, caption: String, scale: CGFloat = 1) -> CGImage? {
+        let r = PrintLayout.stripRect(0, scale: scale)
+        let (w, h) = (Int(r.width.rounded()), Int(r.height.rounded()))
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                                  bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
+        ctx.interpolationQuality = .high
+        let height = CGFloat(h)
+        func flip(_ r: CGRect) -> CGRect { CGRect(x: r.minX, y: height - r.maxY, width: r.width, height: r.height) }
+        ctx.setFillColor(gray: 1, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        drawStrip(0, photos: photos, artwork: artwork, caption: caption, scale: scale, ctx, flip)
+        return ctx.makeImage()
+    }
+
+    /// Strip `i`: the artwork (or the caption), then each photo aspect-filled into its window
+    /// (a grey placeholder for a missing one). `flip` maps layout rects to CoreGraphics.
+    static func drawStrip(_ i: Int, photos: [CGImage?], artwork: CGImage?, caption: String, scale: CGFloat,
+                          _ ctx: CGContext, _ flip: (CGRect) -> CGRect) {
+        if let artwork {
+            ctx.draw(artwork, in: flip(PrintLayout.stripRect(i, scale: scale)))
+        } else {
+            let area = PrintLayout.captionArea(strip: i, scale: scale)
+            let inset = PrintLayout.captionInsetMM * PrintLayout.pixelsPerMM * scale
+            drawCaption(caption, in: flip(area.insetBy(dx: inset, dy: inset)), scale: scale, ctx)
+        }
+        for k in 0..<PrintLayout.photosPerStrip {
+            let window = flip(PrintLayout.photoWindow(strip: i, k, scale: scale))
+            if k < photos.count, let photo = photos[k] {
+                ctx.saveGState()
+                ctx.clip(to: window)
+                ctx.draw(photo, in: PrintLayout.aspectFill(CGSize(width: photo.width, height: photo.height), in: window))
+                ctx.restoreGState()
+            } else {
+                ctx.setFillColor(gray: placeholderGray, alpha: 1)
+                ctx.fill(window)
+            }
+        }
     }
 
     /// Centres the caption's lines in `rect` (CoreGraphics coordinates), at the largest size up to

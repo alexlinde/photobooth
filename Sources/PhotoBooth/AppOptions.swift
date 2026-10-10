@@ -5,6 +5,9 @@ struct AppOptions {
     var windowed = false
     var fakeCamera = false
     var fakeFailRate = 0.0
+    /// Fake camera in strip mode: really print the sheets (default: render and save only, to
+    /// save paper).
+    var printFake = false
     var configPath: String?
     var learnKey = false
     var selfTest = false
@@ -17,6 +20,8 @@ struct AppOptions {
     var snapshotDir: String?
     /// Hidden: `--render-print A B C --out FILE` renders a print sheet and exits.
     var renderPrint: [String]?
+    /// Hidden: `--render-strip-screen A B C --out DIR` renders strip-mode TV frames as PNGs and exits.
+    var renderStripScreen: [String]?
     var renderOut: String?
 
     static let usage = """
@@ -24,6 +29,7 @@ struct AppOptions {
       --windowed              Normal resizable window, cursor visible (development)
       --fake-camera           Use the built-in fake camera (no hardware)
       --fake-fail-rate X      Fake camera: fraction of captures that fail (0–1)
+      --print-fake            Fake camera: really print strip-mode sheets (default: save only)
       --config PATH           Config file (default ~/PhotoBooth/config.json)
       --learn-key             Show HID usage / key code / config string for each key press
       --google-login          Sign in to Google Photos once (opens the browser) and exit
@@ -49,6 +55,7 @@ struct AppOptions {
             case "--fake-fail-rate":
                 guard let v = Double(try value(a)), (0...1).contains(v) else { throw OptionError("--fake-fail-rate needs a number 0–1") }
                 o.fakeFailRate = v
+            case "--print-fake": o.printFake = true
             case "--config": o.configPath = try value(a)
             case "--learn-key": o.learnKey = true
             case "--self-test": o.selfTest = true
@@ -59,6 +66,7 @@ struct AppOptions {
             case "--print-window-id": o.printWindowID = true
             case "--snapshot-dir": o.snapshotDir = try value(a)
             case "--render-print": o.renderPrint = [try value(a), try value(a), try value(a)]
+            case "--render-strip-screen": o.renderStripScreen = [try value(a), try value(a), try value(a)]
             case "--out": o.renderOut = try value(a)
             case "-h", "--help": throw OptionError(nil)
             default:
@@ -69,7 +77,11 @@ struct AppOptions {
             }
         }
         if o.renderPrint != nil, o.renderOut == nil { throw OptionError("--render-print needs --out FILE") }
-        if o.renderOut != nil, o.renderPrint == nil { throw OptionError("--out is only used with --render-print") }
+        if o.renderStripScreen != nil, o.renderOut == nil { throw OptionError("--render-strip-screen needs --out DIR") }
+        if o.renderOut != nil, o.renderPrint == nil, o.renderStripScreen == nil {
+            throw OptionError("--out is only used with --render-print or --render-strip-screen")
+        }
+        if o.printFake, !o.fakeCamera { throw OptionError("--print-fake is only used with --fake-camera") }
         return o
     }
 

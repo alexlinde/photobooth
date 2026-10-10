@@ -3,7 +3,7 @@ import Foundation
 import Observation
 
 /// The CUPS side of printing: lists queues, polls the chosen printer's status and job queue
-/// (only while the print window is open), submits sheets with `lp` and cancels jobs. The tools
+/// (while the print window is open, and all the time in strip mode), submits sheets with `lp` and cancels jobs. The tools
 /// run off the main thread; their output is parsed by `PrintQueues` (BoothCore).
 @MainActor
 @Observable
@@ -20,6 +20,7 @@ final class PrinterService {
     private(set) var jobs: [PrintJob] = []
     /// False until the first poll has finished.
     private(set) var loaded = false
+    private(set) var polling = false
     @ObservationIgnored private var pollTask: Task<Void, Never>?
     @ObservationIgnored private var searchingSince: Date?
     @ObservationIgnored private var polls = 0
@@ -38,6 +39,7 @@ final class PrinterService {
     func startPolling() {
         guard pollTask == nil else { return }
         BoothLog.info(.printing, "Printer status polling started")
+        polling = true
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.refresh()
@@ -47,8 +49,11 @@ final class PrinterService {
     }
 
     func stopPolling() {
+        guard pollTask != nil else { return }
+        BoothLog.info(.printing, "Printer status polling stopped")
         pollTask?.cancel()
         pollTask = nil
+        polling = false
     }
 
     /// Re-reads the queue list (every 10th poll) and the chosen printer's status and jobs.

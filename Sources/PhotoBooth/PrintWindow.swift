@@ -6,8 +6,9 @@ import SwiftUI
 // MARK: - Model
 
 /// State behind the print window (⌘P): the event's photos, the three picked for the sheet (in
-/// click order), a live preview, and the printer. Printing is never automatic: the attendant
-/// picks three photos and presses Print; one sheet = two identical strips.
+/// click order), a live preview, and the printer. The attendant picks three photos and presses
+/// Print; one sheet = two identical strips. In strip mode the booth also prints each finished
+/// strip by itself (`printStrip`).
 @MainActor
 @Observable
 final class PrintModel {
@@ -25,6 +26,10 @@ final class PrintModel {
     private(set) var sending = false
     /// Result of the last Print ("Sent to printer", or what went wrong).
     private(set) var message: (text: String, isError: Bool)?
+    /// The newest sheet in `<event>/prints/` (for Reprint).
+    private(set) var lastSheet: URL?
+    /// Strip mode: what happened to the last finished strip (for the control panel).
+    private(set) var stripStatus: (text: String, isError: Bool)?
 
     /// Saves the attendant's printer choice into config.json.
     @ObservationIgnored var onChoosePrinter: ((String) -> Void)?
@@ -33,6 +38,7 @@ final class PrintModel {
     @ObservationIgnored private var previewPhotos: [URL: CGImage] = [:]
     @ObservationIgnored private var previewTask: Task<Void, Never>?
     @ObservationIgnored private var photosTask: Task<Void, Never>?
+    @ObservationIgnored private var windowOpen = false
 
     static let photosPerSheet = PrintLayout.photosPerStrip
     static let copiesRange = 1...5
@@ -42,6 +48,8 @@ final class PrintModel {
     init(config: BoothConfig) {
         self.config = config
         printer.configured = config.printer
+        updatePolling()
+        refreshLastSheet()
     }
 
     var canPrint: Bool { selection.count == Self.photosPerSheet && printer.printer != nil && !sending }
@@ -52,13 +60,21 @@ final class PrintModel {
 
     /// Window opened: re-read photos and artwork (it may have been edited), start polling.
     func opened() {
+        windowOpen = true
         refreshPhotos()
         reloadArtwork()
-        printer.startPolling()
+        updatePolling()
     }
 
     func closed() {
-        printer.stopPolling()
+        windowOpen = false
+        updatePolling()
+    }
+
+    /// The printer's status is polled while the window is open, and all the time in strip mode
+    /// (the control panel shows it).
+    private func updatePolling() {
+        if windowOpen || config.stripMode { printer.startPolling() } else { printer.stopPolling() }
     }
 
     func configApplied(_ cfg: BoothConfig) {
@@ -74,12 +90,15 @@ final class PrintModel {
             refreshPhotos()
         }
         if artChanged { reloadArtwork() }
+        if folderChanged { refreshLastSheet() }
+        updatePolling()
     }
 
     // MARK: Photos
 
     /// Re-lists the event folder (top-level JPEGs only; `prints/` is skipped).
     func refreshPhotos() {
+        refreshLastSheet()
         let dir = config.eventDirectoryURL
         photosTask?.cancel()
         photosTask = Task { [weak self] in
@@ -91,6 +110,14 @@ final class PrintModel {
                 self.selection.removeAll { gone.contains($0) }
                 self.updatePreview()
             }
+        }
+    }
+
+    private func refreshLastSheet() {
+        let dir = config.printsDirectoryURL
+        Task { [weak self] in
+            let newest = await Task.detached(priority: .utility) { ThumbnailCache.eventPhotos(in: dir).first }.value
+            self?.lastSheet = newest
         }
     }
 
@@ -187,12 +214,77 @@ final class PrintModel {
                 let job = try await self.printer.submit(file, copies: copies, media: cfg.printMedia)
                 self.selection = []
                 self.updatePreview()
+                self.lastSheet = file
                 self.message = ("Sent to printer (\(copies == 1 ? "1 sheet" : "\(copies) sheets"), job \(job))", false)
             } catch {
                 BoothLog.error(.printing, "Print failed: \(error)")
                 self?.message = ("Not printed: \(error)", true)
             }
             self?.sending = false
+        }
+    }
+
+    var canReprint: Bool { lastSheet != nil && printer.printer != nil && !sending }
+
+    /// Sends the newest saved sheet again (`copies` copies), e.g. after a misfeed.
+    func reprintLast() {
+        guard canReprint, let file = lastSheet else { return }
+        let copies = copies, media = config.printMedia
+        sending = true
+        message = nil
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let job = try await self.printer.submit(file, copies: copies, media: media)
+                self.message = ("Sent \(file.lastPathComponent) again (job \(job))", false)
+            } catch {
+                BoothLog.error(.printing, "Reprint failed: \(error)")
+                self.message = ("Not printed: \(error)", true)
+            }
+            self.sending = false
+        }
+    }
+
+    /// Strip mode: a finished strip's three photos, top to bottom. Renders the sheet off the main
+    /// thread (same artwork / caption as the window), saves it to `<event>/prints/` and sends one
+    /// copy; with `send` false (fake camera without --print-fake) it stops after saving.
+    /// `notPrinted` is called (on the main actor) when it can't be printed: no printer, or `lp`
+    /// failed. A job waiting in the queue (e.g. out of paper) counts as sent.
+    func printStrip(_ urls: [URL], skipReason: String?, notPrinted: @escaping @MainActor (String) -> Void) {
+        let cfg = config
+        let toldAlready = skipReason == nil && printer.loaded && printer.printer == nil
+        if toldAlready {
+            // Known now, so the TV says so while the strip is still showing.
+            notPrinted(printer.attention.text)
+        }
+        Task { [weak self] in
+            do {
+                let file = try await Task.detached(priority: .userInitiated) {
+                    try PrintSheet.save(PrintSheet.renderJPEG(photoURLs: urls, config: cfg), in: cfg.printsDirectoryURL)
+                }.value
+                BoothLog.info(.printing, "Strip: rendered \(file.lastPathComponent) from \(urls.map(\.lastPathComponent))")
+                guard let self else { return }
+                self.lastSheet = file
+                if let skipReason {
+                    BoothLog.info(.printing, "Strip: would print \(file.lastPathComponent) (\(skipReason))")
+                    self.stripStatus = ("Saved \(file.lastPathComponent), not printed (\(skipReason))", false)
+                    return
+                }
+                if !self.printer.loaded { await self.printer.refresh() }
+                guard self.printer.printer != nil else {
+                    let why = self.printer.attention.text
+                    BoothLog.error(.printing, "Strip not printed: \(why)")
+                    self.stripStatus = ("Saved \(file.lastPathComponent), not printed: \(why)", true)
+                    if !toldAlready { notPrinted(why) }
+                    return
+                }
+                let job = try await self.printer.submit(file, copies: 1, media: cfg.printMedia)
+                self.stripStatus = ("Sent \(file.lastPathComponent) (job \(job))", false)
+            } catch {
+                BoothLog.error(.printing, "Strip not printed: \(error)")
+                self?.stripStatus = ("Not printed: \(error)", true)
+                notPrinted("\(error)")
+            }
         }
     }
 }
@@ -291,6 +383,9 @@ struct PrintView: View {
                 }
                 Spacer()
                 if model.sending { ProgressView().controlSize(.small) }
+                Button("Reprint last") { model.reprintLast() }
+                    .disabled(!model.canReprint)
+                    .help(model.lastSheet.map { "Send \($0.lastPathComponent) from the prints folder again" } ?? "No saved sheets yet")
                 Button("Print") { model.print() }
                     .buttonStyle(.borderedProminent)
                     .disabled(!model.canPrint)

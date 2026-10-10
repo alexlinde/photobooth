@@ -28,6 +28,9 @@ public enum BoothScenarios {
         ("pause / resume (countdown aborted, capture in flight saved)", pauseResume),
         ("lighting profiles in config", lightingProfiles),
         ("screen layout (booth / control panel displays)", screenLayout),
+        ("strip mode: 3 photos → review, fly-in → strip complete", stripMode),
+        ("strip mode: failed shot is retried; 3 failures → attendant", stripModeRetry),
+        ("strip mode: pause / camera loss discard the strip", stripModeAbort),
     ]
 
     /// Runs everything; prints results; returns true when all pass.
@@ -173,6 +176,138 @@ public enum BoothScenarios {
         let expected = ["capturing(1/3)", "review(1/3)", "between(2/3)", "capturing(2/3)", "review(2/3)",
                         "between(3/3)", "capturing(3/3)", "review(3/3)"]
         try check(keyStates == expected, "sequence \(keyStates)")
+    }
+
+    /// Harness in strip mode, recording `onStripComplete`.
+    static func stripHarness() -> (Harness, StripLog) {
+        var s = BoothSettings()
+        s.stripMode = true
+        s.shotsPerPress = 5  // ignored in strip mode
+        let h = Harness(settings: s)
+        let log = StripLog()
+        h.controller.onStripComplete = { log.strips.append($0) }
+        return (h, log)
+    }
+
+    final class StripLog {
+        var strips: [[URL]] = []
+    }
+
+    static func testURLs(_ n: ClosedRange<Int>) -> [URL] { n.map { URL(fileURLWithPath: "/tmp/test-\($0).jpg") } }
+
+    static func stripMode() async throws {
+        let (h, log) = stripHarness()
+        try await h.startReady()
+        try h.press(expect: .accepted)
+        await h.pump()
+        try check(h.label == "countdown(3,1/3)", "3 shots despite shotsPerPress 5: \(h.label)")
+        // Shot 1: the short review (2.5 s, not reviewSeconds), then the fly-in (0.8 s), then
+        // straight into the next countdown.
+        try await h.step(until: "review(1/3)")
+        try check(h.controller.stripPhotos.isEmpty, "slot filled before the fly-in")
+        await h.advance(2.35)
+        try check(h.label == "review(1/3)", "review ended early: \(h.label)")
+        await h.advance(0.2)
+        try check(h.label == "flyin(1/3)", "expected fly-in after 2.5 s, got \(h.label)")
+        try check(h.controller.stripPhotos.isEmpty, "slot filled before the photo landed")
+        await h.advance(0.65)
+        try check(h.label == "flyin(1/3)", "fly-in ended early: \(h.label)")
+        await h.advance(0.2)
+        try check(h.label == "countdown(3,2/3)", "expected the next countdown after the fly-in, got \(h.label)")
+        try check(h.controller.stripPhotos.map(\.url) == testURLs(1...1), "strip \(h.controller.stripPhotos.map(\.url))")
+        try check(log.strips.isEmpty, "strip complete too early")
+        // Shots 2 and 3, then the finished strip for reviewSeconds.
+        try await h.step(until: "strip-review", within: 40)
+        try check(log.strips == [testURLs(1...3)], "strip complete \(log.strips)")
+        if case .stripReview(let photos) = h.controller.state {
+            try check(photos.map(\.url) == testURLs(1...3), "strip review photos \(photos.map(\.url))")
+        }
+        await h.advance(4.8)
+        try check(h.label == "strip-review", "strip review ended early: \(h.label)")
+        try await h.step(until: "idle", within: 1)
+        try check(h.controller.stripPhotos.isEmpty, "strip not cleared after the press")
+        try check(h.sink.storedCount == 3 && h.camera.captureCount == 3, "stored \(h.sink.storedCount)")
+        let keyStates = h.history.filter { ["capturing", "review", "flyin", "strip", "between"].contains(where: $0.hasPrefix) }
+        let expected = ["capturing(1/3)", "review(1/3)", "flyin(1/3)", "capturing(2/3)", "review(2/3)", "flyin(2/3)",
+                        "capturing(3/3)", "review(3/3)", "flyin(3/3)", "strip-review"]
+        try check(keyStates == expected, "sequence \(keyStates)")
+        // The next press starts an empty strip and fires once more.
+        try h.press(expect: .accepted)
+        try await h.step(until: "strip-review", within: 40)
+        try check(log.strips.count == 2 && log.strips[1] == testURLs(4...6), "second strip \(log.strips)")
+    }
+
+    static func stripModeRetry() async throws {
+        let (h, log) = stripHarness()
+        try await h.startReady()
+        try h.press(expect: .accepted)
+        try await h.step(until: "countdown(3,2/3)", within: 10)
+        // Shot 2 fails: "Oops", then shot 2 again (not idle, not shot 3).
+        h.camera.scriptedFailures = 1
+        try await h.step(until: "notice")
+        try check(h.controller.consecutiveFailures == 1 && h.controller.stripPhotos.count == 1, "after failure: \(h.controller.stripPhotos.count)")
+        try await h.step(until: "countdown(3,2/3)", within: 5)
+        try await h.step(until: "strip-review", within: 40)
+        try check(log.strips == [testURLs(1...3)], "strip complete \(log.strips)")
+        try check(h.camera.captureCount == 4 && h.controller.consecutiveFailures == 0, "captures \(h.camera.captureCount)")
+        let i = h.history.firstIndex(of: "notice")!
+        let pressed = h.history.firstIndex(of: "countdown(3,1/3)")!
+        try check(!h.history[pressed...].contains("idle"), "went idle mid-strip: \(h.history)")
+        try check(h.history[i + 1] == "countdown(3,2/3)", "after notice: \(h.history[i + 1])")
+        try await h.step(until: "idle", within: 6)
+        // Three failures in a row: retried twice, then the attendant screen; nothing prints.
+        h.camera.scriptedFailures = 3
+        try h.press(expect: .accepted)
+        try await h.step(until: "attendant(captureFailures)", within: 30)
+        let press = h.history[(h.history.lastIndex(of: "idle")! + 1)...]
+        try check(press.filter { $0 == "capturing(1/3)" }.count == 3 && press.filter { $0 == "notice" }.count == 2, "retries \(press)")
+        try check(h.controller.stripPhotos.isEmpty && log.strips.count == 1, "printed after failures: \(log.strips)")
+    }
+
+    static func stripModeAbort() async throws {
+        let (h, log) = stripHarness()
+        try await h.startReady()
+        // Paused mid-strip: discarded (photos stay saved), nothing prints, even after resume.
+        try h.press(expect: .accepted)
+        try await h.step(until: "countdown(3,2/3)", within: 10)
+        try check(h.controller.stripPhotos.count == 1, "strip \(h.controller.stripPhotos.count)")
+        h.controller.pause()
+        await h.pump()
+        try check(h.label == "paused" && h.controller.stripPhotos.isEmpty, "pause: \(h.label), \(h.controller.stripPhotos.count)")
+        await h.advance(30)
+        h.controller.resume()
+        await h.advance(30)
+        try check(h.label == "idle" && log.strips.isEmpty && h.sink.storedCount == 1, "after resume: \(h.label) \(log.strips)")
+        // Paused during the fly-in: the same.
+        try h.press(expect: .accepted)
+        try await h.step(until: "flyin(1/3)", within: 10)
+        h.controller.pause()
+        await h.pump()
+        try check(h.label == "paused" && h.controller.stripPhotos.isEmpty, "pause in fly-in: \(h.label)")
+        h.controller.resume()
+        await h.pump()
+        // Camera lost between shots: discarded.
+        try h.press(expect: .accepted)
+        try await h.step(until: "countdown(2,2/3)", within: 10)
+        h.camera.setState(.searching)
+        await h.pump()
+        try check(h.label == "waiting" && h.controller.stripPhotos.isEmpty, "camera lost: \(h.label)")
+        h.camera.setState(.ready(name: "Fake"))
+        await h.advance(30)
+        try check(h.label == "idle" && log.strips.isEmpty, "after camera loss: \(h.label) \(log.strips)")
+        // Camera lost during a review: abandoned when the photo lands, not another countdown.
+        try h.press(expect: .accepted)
+        try await h.step(until: "review(2/3)", within: 20)
+        h.camera.setState(.searching)
+        try await h.step(until: "waiting", within: 5)
+        try check(h.controller.stripPhotos.isEmpty && !h.history.contains("countdown(3,3/3)"), "camera lost in review: \(h.history.suffix(4))")
+        h.camera.setState(.ready(name: "Fake"))
+        await h.advance(30)
+        try check(h.label == "idle" && log.strips.isEmpty, "after camera loss in review: \(h.label)")
+        // A full strip still works afterwards.
+        try h.press(expect: .accepted)
+        try await h.step(until: "strip-review", within: 40)
+        try check(log.strips.count == 1 && log.strips[0].count == 3, "strip \(log.strips)")
     }
 
     static func pressDuringCountdownIgnored() async throws {
@@ -362,6 +497,11 @@ public enum BoothScenarios {
         try check(e2 == nil, "partial config error: \(String(describing: e2))")
         try check(c.eventName == "Anna's 40th" && c.shotsPerPress == 3 && c.countdownSeconds == 3, "values \(c)")
         try check(c.display == .index(1), "display \(c.display)")
+        try check(!c.stripMode && BoothSettings(c).shotsPerPress == 3, "stripMode default")
+        let (sm, e5) = ConfigLoader.decode(Data(#"{"stripMode": true}"#.utf8))
+        try check(e5 == nil && sm.stripMode && BoothSettings(sm).stripMode, "stripMode: \(String(describing: e5))")
+        try check(ConfigLoader.decode(sm.encodedJSON()).0 == sm, "stripMode round trip")
+        try check(ConfigLoader.decode(Data(#"{"stripMode": "yes"}"#.utf8)).1 != nil, "stripMode wrong type")
         try check(c.buttonDevice == .stealthSwitch3, "device \(String(describing: c.buttonDevice))")
         try check(c.key?.hidUsage == 0x68 && c.key?.keyCode == 105, "key \(String(describing: c.key))")
         // null device = any keyboard; display by name.

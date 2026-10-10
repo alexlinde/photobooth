@@ -46,6 +46,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var input: ButtonInput?
     private var preview: LivePreviewNSView?
     private var boothHost: KioskHostingView<BoothRootView>?
+    /// Strip mode: one strip as printed (no photos), under the TV's strip column.
+    private var stripBackground: CGImage?
     private var learnModel: LearnKeyModel?
     private var autoPressTimer: Timer?
     private var uploads: UploadService?
@@ -166,12 +168,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                          decodeForReview: ImageDecoding.reviewDecoder(maxPixel: maxPixel))
         self.controller = controller
         controller.onStateChange = { [weak self] s in self?.stateChanged(s) }
+        controller.onStripComplete = { [weak self] urls in self?.printStrip(urls) }
 
         let preview = LivePreviewNSView(mirrored: config.mirrorPreview)
         preview.attach(camera.liveViewFrames())
         self.preview = preview
 
-        let host = KioskHostingView(rootView: BoothRootView(controller: controller, preview: preview, idlePrompt: config.idlePrompt))
+        let host = KioskHostingView(rootView: boothView(controller, preview))
         host.hidesCursor = kiosk
         boothHost = host
         window.contentView = host
@@ -187,6 +190,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let printModel = PrintModel(config: config)
         printModel.onChoosePrinter = { [weak self] name in self?.savePrinter(name) }
         self.printModel = printModel
+        model.printing = printModel
+        refreshStripBackground(config)
 
         let input = ButtonInput(key: config.key, mode: config.buttonInput, deviceFilter: config.buttonDevice)
         input.onPress = { [weak self] in
@@ -218,8 +223,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// Local save + Google Photos upload queue. The queue is per event folder/album, so a config
     /// reload that changes either starts a new one (the old one's state file keeps its progress).
     private func makeSink(_ config: BoothConfig) -> PhotoSink {
-        if options.fakeCamera {
-            return LocalFolderPhotoSink(directory: config.eventDirectoryURL)  // never upload fake photos
+        if options.fakeCamera || !config.upload {
+            // Never upload fake photos; `upload: false` saves locally only.
+            if uploads != nil {
+                uploads?.stop()
+                uploads = nil
+                panelModel?.uploads = nil
+            }
+            return LocalFolderPhotoSink(directory: config.eventDirectoryURL)
         }
         if uploads?.matches(config) != true {
             uploads?.stop()
@@ -228,6 +239,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         return UploadingPhotoSink(local: LocalFolderPhotoSink(directory: config.eventDirectoryURL),
                                   queue: uploads?.queue)
+    }
+
+    private func boothView(_ controller: BoothController, _ preview: LivePreviewNSView) -> BoothRootView {
+        BoothRootView(controller: controller, preview: preview, idlePrompt: config.idlePrompt,
+                      stripMode: config.stripMode, stripBackground: stripBackground)
+    }
+
+    /// Strip mode: renders the strip column's artwork / caption (as printed) off the main thread.
+    private func refreshStripBackground(_ cfg: BoothConfig) {
+        guard cfg.stripMode else { stripBackground = nil; return }
+        let url = cfg.printTemplateURL, caption = cfg.printCaptionText
+        Task { [weak self] in
+            let image = await Task.detached(priority: .userInitiated) { () -> CGImage? in
+                let art = PrintSheet.loadArtwork(url)
+                if let w = art.warning { BoothLog.info(.printing, "Strip artwork: \(w)") }
+                return PrintSheet.renderStrip(photos: [], artwork: art.image, caption: caption)
+            }.value
+            guard let self, let controller = self.controller, let preview = self.preview else { return }
+            self.stripBackground = image
+            self.boothHost?.rootView = self.boothView(controller, preview)
+        }
+    }
+
+    /// Strip mode: a finished strip. Rendered, saved to prints/ and sent to the printer in the
+    /// background; with --fake-camera only saved (unless --print-fake), to save paper.
+    private func printStrip(_ urls: [URL]) {
+        guard let printModel else { return }
+        let skip: String? = !config.autoPrint ? "autoPrint is off"
+            : options.fakeCamera && !options.printFake ? "fake camera; --print-fake prints it" : nil
+        if skip != nil, !options.fakeCamera { controller?.stripMessage = "Your strip is saved" }
+        printModel.printStrip(urls, skipReason: skip) { [weak self] why in
+            BoothLog.error(.printing, "Strip not printed; the TV asks the guest to see the attendant (\(why))")
+            guard let c = self?.controller, case .stripReview = c.state else { return }
+            c.stripMessage = "Your strip is saved — ask the attendant for your print"
+        }
     }
 
     private var snapshotIndex = 0
@@ -378,6 +424,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         camera?.setProfile(cfg.cameraProfile)
         panelModel?.configApplied(cfg)
         printModel?.configApplied(cfg)
+        refreshStripBackground(cfg)  // also picks up edited artwork
         let wasError = configError != nil
         configError = nil
         guard cfg != config || wasError else { return }
@@ -389,7 +436,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             controller.sink = makeSink(cfg)
             controller.resolveAttendant(kind: "config")
             if let preview { preview.mirrored = cfg.mirrorPreview }
-            boothHost?.rootView = BoothRootView(controller: controller, preview: preview!, idlePrompt: cfg.idlePrompt)
+            if let preview { boothHost?.rootView = boothView(controller, preview) }
         }
         input?.reconfigure(key: cfg.key, mode: cfg.buttonInput, deviceFilter: cfg.buttonDevice)
         screensChanged()
