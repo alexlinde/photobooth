@@ -18,6 +18,8 @@ public struct BoothSettings: Equatable, Sendable {
     var maxConsecutiveFailures = 3
     /// Retry interval for saving photos while on the storage attendant screen.
     var storageRetrySeconds = 15.0
+    /// Treat a (near) black photo as a missed flash and take it again (`lighting: strobes`).
+    var rejectMissedFlash = true
 
     init() {}
 
@@ -28,6 +30,7 @@ public struct BoothSettings: Equatable, Sendable {
         pauseBetweenShotsSeconds = c.pauseBetweenShotsSeconds
         stripMode = c.stripMode
         debounceSeconds = c.debounce
+        rejectMissedFlash = c.lighting == .strobes
     }
 
     /// Strip mode: each photo's full-screen review (at most `reviewSeconds`) before it flies
@@ -43,6 +46,8 @@ public struct BoothSettings: Equatable, Sendable {
 public enum AttendantIssue: Equatable, Sendable {
     case config(String)
     case captureFailures(String)
+    /// Repeated black photos with `lighting: strobes`.
+    case missedFlash(String)
     case storage(String)
     case inputPermission(String)
     case other(String)
@@ -51,6 +56,7 @@ public enum AttendantIssue: Equatable, Sendable {
         switch self {
         case .config: return "Settings problem"
         case .captureFailures: return "The camera isn't taking photos"
+        case .missedFlash: return "The flash isn't firing"
         case .storage: return "Photos can't be saved"
         case .inputPermission: return "Button permission needed"
         case .other: return "Attendant needed"
@@ -59,7 +65,7 @@ public enum AttendantIssue: Equatable, Sendable {
 
     public var detail: String {
         switch self {
-        case .config(let s), .captureFailures(let s), .storage(let s), .inputPermission(let s), .other(let s): return s
+        case .config(let s), .captureFailures(let s), .missedFlash(let s), .storage(let s), .inputPermission(let s), .other(let s): return s
         }
     }
 
@@ -67,6 +73,7 @@ public enum AttendantIssue: Equatable, Sendable {
         switch self {
         case .config: return "config"
         case .captureFailures: return "captureFailures"
+        case .missedFlash: return "missedFlash"
         case .storage: return "storage"
         case .inputPermission: return "inputPermission"
         case .other: return "other"
@@ -423,6 +430,20 @@ public final class BoothController {
                     return
                 }
                 guard id == sessionID else { return }
+                // A black frame means the strobes didn't fire: never save it as a photo (no upload,
+                // no strip); keep it aside and treat it like a failed capture.
+                if settings.rejectMissedFlash {
+                    let jpeg = photo.jpeg
+                    let mean = await Task.detached(priority: .userInitiated) { ImageDecoding.meanLuminance(jpeg) }.value
+                    guard id == sessionID else { return }
+                    if let mean, ImageDecoding.isMissedFlash(meanLuminance: mean) {
+                        if await flashMissed(photo, brightness: mean, id: id, retry: strip) {
+                            retrying = true
+                            continue
+                        }
+                        return
+                    }
+                }
                 consecutiveFailures = 0
                 BoothLog.info(.booth, "Captured shot \(shot)/\(n): \(photo.jpeg.count) bytes (\(photo.cameraFilename ?? "?"))")
 
@@ -481,21 +502,47 @@ public final class BoothController {
         }
     }
 
+    /// Notice after a missed flash (the photo came out black).
+    public static let missedFlashNotice = "Oops — the flash didn't fire.\nLet's try that again!"
+
     /// Returns true when the session should try the same shot again (strip mode, after the
     /// notice); otherwise the session is over (idle, paused or attendant).
     private func captureFailed(_ error: Error, id: Int, retry: Bool) async -> Bool {
         let cameraOK = camera.state.isReady
         if cameraOK { consecutiveFailures += 1 }
         BoothLog.error(.camera, "Capture failed (\(consecutiveFailures) in a row, camera \(camera.state)): \(error)")
+        return await shotFailed(notice: "Oops — let's try that again", id: id, retry: retry,
+            issue: .captureFailures("\(consecutiveFailures) photos in a row failed. Last error: \(Self.describe(error)). Check the camera (battery, memory card, lens cap, settings)."))
+    }
+
+    /// A black photo with strobes: kept in `rejected/` for diagnostics (not uploaded, not
+    /// listed), then handled like a failed capture, counting toward the attendant screen.
+    private func flashMissed(_ photo: CapturedPhoto, brightness: Double, id: Int, retry: Bool) async -> Bool {
+        consecutiveFailures += 1
+        BoothLog.error(.camera, String(format: "Missed flash: photo rejected, mean brightness %.1f/255 (below %.0f; %d in a row)",
+                                       brightness, ImageDecoding.missedFlashThreshold, consecutiveFailures))
+        do {
+            if let url = try await sink.storeRejected(photo) { BoothLog.info(.storage, "Kept rejected photo at \(url.path)") }
+        } catch {
+            BoothLog.error(.storage, "Keeping the rejected photo failed: \(error)")
+        }
+        guard id == sessionID else { return false }
+        return await shotFailed(notice: Self.missedFlashNotice, id: id, retry: retry,
+            issue: .missedFlash("\(consecutiveFailures) photos in a row came out black: the strobes didn't fire. Check that both strobes are switched on, the R2 transmitter is seated firmly in the camera's hot shoe and its batteries aren't flat, and the transmitter and strobes are on the same channel and group (A). The transmitter's TEST button should fire both strobes."))
+    }
+
+    /// The shared tail of a failed shot: the attendant screen after too many in a row, otherwise
+    /// the notice, then the same shot again (`retry`, strip mode) or idle.
+    private func shotFailed(notice: String, id: Int, retry: Bool, issue: @autoclosure () -> AttendantIssue) async -> Bool {
         if isPaused, consecutiveFailures < settings.maxConsecutiveFailures {
             returnToIdle()
             return false
         }
         if consecutiveFailures >= settings.maxConsecutiveFailures {
-            enterAttendant(.captureFailures("\(consecutiveFailures) photos in a row failed. Last error: \(Self.describe(error)). Check the camera (battery, memory card, lens cap, settings)."))
+            enterAttendant(issue())
             return false
         }
-        set(.notice("Oops — let's try that again"))
+        set(.notice(notice))
         do { try await clock.sleep(seconds: settings.noticeSeconds) } catch { return false }
         guard id == sessionID else { return false }
         if retry, case .notice = state, !isPaused, camera.state.isReady {

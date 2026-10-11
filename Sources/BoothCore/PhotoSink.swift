@@ -8,6 +8,13 @@ import SonyCamera
 // upload-queue implementation (conform it to `PhotoSink`, or wrap it) in `AppBooth.makeSink`.
 public protocol PhotoSink: Sendable {
     func store(_ photo: CapturedPhoto) async throws -> URL
+    /// A frame the booth threw away (missed flash), kept for diagnostics only: never uploaded,
+    /// never listed with the photos. nil = not kept.
+    func storeRejected(_ photo: CapturedPhoto) async throws -> URL?
+}
+
+public extension PhotoSink {
+    func storeRejected(_ photo: CapturedPhoto) async throws -> URL? { nil }
 }
 
 /// Interim sink: writes `<eventDirectory>/YYYYMMDD-HHMMSS.jpg` atomically, adding `-2`,
@@ -19,6 +26,15 @@ public struct LocalFolderPhotoSink: PhotoSink {
     public func store(_ photo: CapturedPhoto) async throws -> URL {
         let dir = directory
         return try await Task.detached(priority: .userInitiated) {
+            try Self.write(photo, into: dir)
+        }.value
+    }
+
+    /// `<eventDirectory>/rejected/YYYYMMDD-HHMMSS.jpg`: a subfolder, so the photo listings and the
+    /// upload queue (which only look at the event folder's own JPEGs) skip it.
+    public func storeRejected(_ photo: CapturedPhoto) async throws -> URL? {
+        let dir = directory.appendingPathComponent("rejected", isDirectory: true)
+        return try await Task.detached(priority: .utility) {
             try Self.write(photo, into: dir)
         }.value
     }

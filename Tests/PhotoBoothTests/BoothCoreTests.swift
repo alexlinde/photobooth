@@ -23,6 +23,10 @@ final class BoothCoreTests: XCTestCase {
     func testStripMode() async throws { try await BoothScenarios.stripMode() }
     func testStripModeRetry() async throws { try await BoothScenarios.stripModeRetry() }
     func testStripModeAbort() async throws { try await BoothScenarios.stripModeAbort() }
+    func testMissedFlashBrightness() async throws { try await BoothScenarios.missedFlashBrightness() }
+    func testMissedFlashRetake() async throws { try await BoothScenarios.missedFlashRetake() }
+    func testStripModeMissedFlash() async throws { try await BoothScenarios.stripModeMissedFlash() }
+    func testMissedFlashAmbient() async throws { try await BoothScenarios.missedFlashAmbient() }
 
     func testDefaultConfigJSONIsStable() throws {
         let json = String(decoding: BoothConfig().encodedJSON(), as: UTF8.self)

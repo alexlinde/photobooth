@@ -154,6 +154,11 @@ struct UploadingPhotoSink: PhotoSink {
         if let queue { await queue.enqueue(url) }
         return url
     }
+
+    /// Local only: a rejected frame is never uploaded.
+    func storeRejected(_ photo: CapturedPhoto) async throws -> URL? {
+        try await local.storeRejected(photo)
+    }
 }
 
 /// `PhotoBooth --google-login`: one-time interactive sign-in; stores the refresh token in Keychain.

@@ -61,6 +61,13 @@ Settled in a test session (black backdrop, balloon arch, guests about 2 m from t
   of idle minutes, the first flash only wakes the transmitter and that photo comes out black. The booth's USB
   half-press does not wake it. Single contact mode gives up TTL, which the booth doesn't use.
 - Quick check: the transmitter's TEST button should fire both strobes.
+- **Missed flashes are retaken.** If the strobes don't fire, the photo comes out black (mean brightness about 0/255,
+  where good photos on the black backdrop measure 55-70) although the camera reports success. With `"lighting":
+  "strobes"` the booth checks every photo (on a 64 px thumbnail) and treats anything below 8/255 as a missed flash: it's
+  not saved with the photos, not uploaded and not used in a strip, the TV says "Oops — the flash didn't fire. Let's try
+  that again!", and the log records the measured brightness. The frame is kept for diagnostics in
+  `~/PhotoBooth/<event>/rejected/` (not uploaded, not listed). Three in a row (or mixed with other failed captures) bring
+  up the attendant screen "The flash isn't firing". Ambient and "don't change camera" never reject a photo.
 
 ## Build and install
 
@@ -320,7 +327,7 @@ photos and prints them as a sheet (two identical strips, one copy), with no atte
   control panel shows why (reprint it from the print window). A job waiting for paper or ink counts as sent: it
   prints once the attendant fixes the printer.
 - A failed shot shows "Oops" and that photo is taken again (3 failures in a row still bring up the attendant
-  screen). Pausing the booth or losing the camera mid-strip abandons it: nothing prints, and the photos taken so far
+  screen). A black photo from a [missed flash](#strobe-setup) counts as a failed shot: it never reaches the strip. Pausing the booth or losing the camera mid-strip abandons it: nothing prints, and the photos taken so far
   stay saved in the event folder.
 - The control panel's Status shows the printer (with the queue length) and what happened to the last strip; the
   printer is checked every 3 s while strip mode is on.
@@ -387,13 +394,14 @@ don't leave a text field focused. See `docs/stealthswitch3-protocol.md` for prog
 |---|---|
 | "Getting the camera ready..." | Waiting for the camera (off, wrong USB mode, or permission missing). It reconnects by itself. |
 | Idle: live preview + prompt | Ready; press the button. |
-| 3-2-1 countdown | Presses are ignored. |
+| 3-2-1 countdown | Presses are ignored. A bouncing arrow with "Look here!" at the top centre of the TV points at the camera (centred on the whole screen, also in strip mode). "Photo 2 of 3" sits at the bottom. |
 | White flash | The shutter fired. |
 | Review ("Saved!") | The photo, not mirrored, for `reviewSeconds`; then back to idle. |
 | Strip down the right (strip mode) | The strip as it will print; each photo shrinks into its window after a short review. |
 | Finished strip, "Printing your strip…" (strip mode) | The sheet is on its way to the printer. "Ask the attendant for your print" means it couldn't be sent. |
-| "Oops - let's try that again" | A capture failed; returns to idle after a moment. |
-| **ATTENDANT NEEDED** | Repeated failures or a config / storage / permission problem. Fix it, then press Ctrl+Opt+Cmd+R (or Reset in the control panel). |
+| "Oops - let's try that again" | A capture failed; returns to idle after a moment (strip mode: takes that photo again). |
+| "Oops — the flash didn't fire. Let's try that again!" | Strobes profile: the photo came out black, so it was set aside in `rejected/` (not saved with the photos or uploaded). Like a failed capture: idle, or in strip mode the same photo again. |
+| **ATTENDANT NEEDED** | Repeated failures ("The flash isn't firing": check the strobes are on, the R2 transmitter is seated on the hot shoe, its batteries, and that channel and group match) or a config / storage / permission problem. Fix it, then press Ctrl+Opt+Cmd+R (or Reset in the control panel). |
 | "Back in a moment" | Paused from the control panel; presses are ignored. |
 
 Attendant keys: **Ctrl+Opt+Cmd+Q** quit, **Ctrl+Opt+Cmd+R** retry / reload config, **⌘,** control panel,
@@ -434,7 +442,8 @@ Modules:
 `--print-window-id`, `--snapshot-dir DIR` (PNGs of the booth window and the control panel after each state change,
 plus a full-height render of the panel), `--render-print A.jpg B.jpg C.jpg --out SHEET.jpg` (renders a print sheet
 with the configured artwork / caption and exits; prints nothing), `--render-strip-screen A.jpg B.jpg C.jpg --out DIR`
-(renders strip-mode TV frames at 1920 x 1080 into DIR: idle, countdown, review, mid fly-in and the finished strip),
+(renders TV frames at 1920 x 1080 into DIR: strip-mode idle, countdown, review, mid fly-in, the finished strip and the
+missed-flash notice, plus a normal-mode countdown),
 `--print-fake` (with `--fake-camera`: really print strip-mode sheets; without it fake strips are rendered and saved to
 `prints/` but not printed, and the log says "would print", to save paper). Develop without hardware (booth and
 control panel as normal windows):

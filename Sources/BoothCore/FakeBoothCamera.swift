@@ -27,6 +27,8 @@ public final class FakeBoothCamera: BoothCamera {
     var options: Options
     /// Fail the next N captures regardless of `failRate` (tests).
     var scriptedFailures = 0
+    /// Return an all-black JPEG for the next N captures, like a missed flash (tests).
+    var scriptedBlackFrames = 0
     private(set) var prepareCount = 0
     private(set) var cancelPrepareCount = 0
     private(set) var captureCount = 0
@@ -197,7 +199,11 @@ public final class FakeBoothCamera: BoothCamera {
         let size = options.captureSize
         let started = clock.now()
         // Generate off the main thread while the simulated shutter delay runs.
-        let gen = Task.detached(priority: .userInitiated) { FakeImages.captureJPEG(size: size, shot: shot, at: started) }
+        let black = scriptedBlackFrames > 0
+        if black { scriptedBlackFrames -= 1 }
+        let gen = Task.detached(priority: .userInitiated) {
+            black ? FakeImages.blackJPEG(size: size) : FakeImages.captureJPEG(size: size, shot: shot, at: started)
+        }
         try await clock.sleep(seconds: options.captureDelay)
         let jpeg = await gen.value
         let fail: Bool
@@ -289,7 +295,21 @@ public enum FakeImages {
         drawText(ctx, "Fake photo #\(shot)", at: CGPoint(x: 60 * s, y: size.height / 2), size: 90 * s)
         drawText(ctx, f.string(from: date), at: CGPoint(x: 60 * s, y: size.height / 2 - 110 * s), size: 50 * s)
         drawText(ctx, "◀ LEFT (not mirrored)", at: CGPoint(x: 30 * s, y: 30 * s), size: 40 * s)
-        guard let img = ctx.makeImage() else { return nil }
+        return ctx.makeImage().flatMap(jpeg)
+    }
+
+    /// What the camera returns when the strobes don't fire against a black backdrop.
+    static func blackJPEG(size: CGSize) -> Data? { solidJPEG(size: size, gray: 0) }
+
+    /// One flat grey (0–1) all over (tests).
+    static func solidJPEG(size: CGSize, gray: CGFloat) -> Data? {
+        guard let ctx = makeContext(size) else { return nil }
+        ctx.setFillColor(CGColor(gray: gray, alpha: 1))
+        ctx.fill(CGRect(origin: .zero, size: size))
+        return ctx.makeImage().flatMap(jpeg)
+    }
+
+    static func jpeg(_ img: CGImage) -> Data? {
         let data = NSMutableData()
         guard let dest = CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil) else { return nil }
         CGImageDestinationAddImage(dest, img, [kCGImageDestinationLossyCompressionQuality: 0.85] as CFDictionary)

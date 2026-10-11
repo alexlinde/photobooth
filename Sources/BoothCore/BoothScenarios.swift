@@ -31,6 +31,10 @@ public enum BoothScenarios {
         ("strip mode: 3 photos → review, fly-in → strip complete", stripMode),
         ("strip mode: failed shot is retried; 3 failures → attendant", stripModeRetry),
         ("strip mode: pause / camera loss discard the strip", stripModeAbort),
+        ("missed flash: brightness of black vs grey JPEGs", missedFlashBrightness),
+        ("missed flash: black photo rejected, kept aside, retaken", missedFlashRetake),
+        ("missed flash in strip mode: shot retaken; 3 in a row → attendant", stripModeMissedFlash),
+        ("missed flash: ambient lighting accepts a black photo", missedFlashAmbient),
     ]
 
     /// Runs everything; prints results; returns true when all pass.
@@ -55,13 +59,24 @@ public enum BoothScenarios {
         private let lock = NSLock()
         private var _failing = false
         private var _stored: [CapturedPhoto] = []
+        private var _rejected: [CapturedPhoto] = []
         var failing: Bool {
             get { lock.lock(); defer { lock.unlock() }; return _failing }
             set { lock.lock(); _failing = newValue; lock.unlock() }
         }
         var storedCount: Int { lock.lock(); defer { lock.unlock() }; return _stored.count }
+        var storedJPEGs: [Data] { lock.lock(); defer { lock.unlock() }; return _stored.map(\.jpeg) }
+        var rejectedCount: Int { lock.lock(); defer { lock.unlock() }; return _rejected.count }
 
         func store(_ photo: CapturedPhoto) async throws -> URL { try storeSync(photo) }
+
+        func storeRejected(_ photo: CapturedPhoto) async throws -> URL? { rejectSync(photo) }
+
+        private func rejectSync(_ photo: CapturedPhoto) -> URL {
+            lock.lock(); defer { lock.unlock() }
+            _rejected.append(photo)
+            return URL(fileURLWithPath: "/tmp/rejected/test-\(_rejected.count).jpg")
+        }
 
         private func storeSync(_ photo: CapturedPhoto) throws -> URL {
             lock.lock(); defer { lock.unlock() }
@@ -310,6 +325,96 @@ public enum BoothScenarios {
         try check(log.strips.count == 1 && log.strips[0].count == 3, "strip \(log.strips)")
     }
 
+    static func missedFlashBrightness() async throws {
+        let size = CGSize(width: 600, height: 338)
+        guard let black = FakeImages.blackJPEG(size: size), let grey = FakeImages.solidJPEG(size: size, gray: 0.5),
+              let dark = FakeImages.solidJPEG(size: size, gray: 0.22) else { throw Failure(description: "couldn't make JPEGs") }
+        let b = ImageDecoding.meanLuminance(black), g = ImageDecoding.meanLuminance(grey), d = ImageDecoding.meanLuminance(dark)
+        try check(b != nil && b! < 1 && ImageDecoding.isMissedFlash(meanLuminance: b!), "black: \(String(describing: b))")
+        try check(g != nil && (100...160).contains(g!) && !ImageDecoding.isMissedFlash(meanLuminance: g!), "grey: \(String(describing: g))")
+        // About as dark as a good photo on the black backdrop (55–70): kept.
+        try check(d != nil && (40...80).contains(d!) && !ImageDecoding.isMissedFlash(meanLuminance: d!), "dark: \(String(describing: d))")
+        try check(ImageDecoding.meanLuminance(Data([0xFF, 0xD8, 0xFF, 0xD9])) == nil, "garbage decodes")
+        // Only the strobes profile rejects black photos.
+        var c = BoothConfig()
+        try check(BoothSettings(c).rejectMissedFlash, "strobes should reject")
+        c.lighting = .ambient
+        try check(!BoothSettings(c).rejectMissedFlash, "ambient should not reject")
+        c.lighting = .none
+        try check(!BoothSettings(c).rejectMissedFlash, "none should not reject")
+    }
+
+    static func missedFlashRetake() async throws {
+        let h = Harness()
+        try await h.startReady()
+        // Black, then good. Normal mode: like a failed capture, the notice then idle; the guest
+        // presses again.
+        h.camera.scriptedBlackFrames = 1
+        try h.press(expect: .accepted)
+        try await h.step(until: "notice")
+        try check(h.controller.state == .notice(BoothController.missedFlashNotice), "notice \(h.controller.state)")
+        try check(h.sink.storedCount == 0 && h.sink.rejectedCount == 1, "stored \(h.sink.storedCount), rejected \(h.sink.rejectedCount)")
+        try check(h.controller.consecutiveFailures == 1, "failures \(h.controller.consecutiveFailures)")
+        try check(!h.history.contains("review(1/1)"), "black photo reviewed: \(h.history)")
+        try await h.step(until: "idle", within: 5)
+        try h.press(expect: .accepted)
+        try await h.step(until: "review(1/1)")
+        try check(h.sink.storedCount == 1 && h.sink.rejectedCount == 1, "stored \(h.sink.storedCount), rejected \(h.sink.rejectedCount)")
+        try check(h.controller.consecutiveFailures == 0, "failures not reset by a good photo")
+        if let jpeg = h.sink.storedJPEGs.first, let mean = ImageDecoding.meanLuminance(jpeg) {
+            try check(!ImageDecoding.isMissedFlash(meanLuminance: mean), "stored a black photo (\(mean))")
+        }
+        try check(h.camera.captureCount == 2, "captures \(h.camera.captureCount)")
+    }
+
+    static func stripModeMissedFlash() async throws {
+        let (h, log) = stripHarness()
+        try await h.startReady()
+        try h.press(expect: .accepted)
+        try await h.step(until: "countdown(3,3/3)", within: 20)
+        // Shot 3 comes out black: rejected, "Oops", shot 3 again; the strip has 3 good photos.
+        h.camera.scriptedBlackFrames = 1
+        try await h.step(until: "notice")
+        try check(h.controller.state == .notice(BoothController.missedFlashNotice), "notice \(h.controller.state)")
+        try check(h.controller.stripPhotos.count == 2 && h.sink.rejectedCount == 1, "strip \(h.controller.stripPhotos.count)")
+        try await h.step(until: "countdown(3,3/3)", within: 5)
+        try await h.step(until: "strip-review", within: 20)
+        try check(log.strips == [testURLs(1...3)], "strip complete \(log.strips)")
+        try check(h.sink.storedCount == 3 && h.sink.rejectedCount == 1 && h.camera.captureCount == 4, "stored \(h.sink.storedCount)")
+        try check(h.controller.consecutiveFailures == 0, "failures \(h.controller.consecutiveFailures)")
+        try await h.step(until: "idle", within: 6)
+        // Three black photos in a row: retried twice, then the attendant screen about the flash.
+        h.camera.scriptedBlackFrames = 3
+        try h.press(expect: .accepted)
+        try await h.step(until: "attendant(missedFlash)", within: 30)
+        let press = h.history[(h.history.lastIndex(of: "idle")! + 1)...]
+        try check(press.filter { $0 == "capturing(1/3)" }.count == 3 && press.filter { $0 == "notice" }.count == 2, "retries \(press)")
+        try check(h.controller.attendantIssue?.title == "The flash isn't firing", "issue \(String(describing: h.controller.attendantIssue))")
+        try check(h.controller.attendantIssue?.detail.contains("transmitter") == true, "detail \(String(describing: h.controller.attendantIssue))")
+        try check(h.sink.storedCount == 3 && h.sink.rejectedCount == 4 && log.strips.count == 1, "stored \(h.sink.storedCount)")
+        // A camera reconnect doesn't clear it (the strobes are the problem); the attendant key does.
+        h.camera.setState(.searching)
+        await h.pump()
+        h.camera.setState(.ready(name: "Fake"))
+        await h.pump()
+        try check(h.label == "attendant(missedFlash)", "reconnect cleared it: \(h.label)")
+        h.controller.attendantReset()
+        await h.pump()
+        try check(h.label == "idle" && h.controller.consecutiveFailures == 0, "after reset: \(h.label)")
+    }
+
+    static func missedFlashAmbient() async throws {
+        var s = BoothSettings()
+        s.rejectMissedFlash = false
+        let h = Harness(settings: s)
+        try await h.startReady()
+        h.camera.scriptedBlackFrames = 1
+        try h.press(expect: .accepted)
+        try await h.step(until: "review(1/1)")
+        try check(h.sink.storedCount == 1 && h.sink.rejectedCount == 0, "stored \(h.sink.storedCount), rejected \(h.sink.rejectedCount)")
+        try check(!h.history.contains("notice"), "notice with ambient: \(h.history)")
+    }
+
     static func pressDuringCountdownIgnored() async throws {
         let h = Harness()
         try await h.startReady()
@@ -479,6 +584,11 @@ public enum BoothScenarios {
         try check(files.count == 3, "leftover files: \(files)")
         let written = try Data(contentsOf: a)
         try check(written == p.jpeg, "content mismatch")
+        // Rejected frames go to rejected/, out of sight of the photo listings (top-level JPEGs only).
+        let r = try await sink.storeRejected(p)
+        try check(r == dir.appendingPathComponent("rejected/20261009-183005.jpg"), "rejected = \(String(describing: r))")
+        let jpgs = try FileManager.default.contentsOfDirectory(atPath: dir.path).filter { $0.hasSuffix(".jpg") }
+        try check(jpgs.count == 3, "rejected frame among the photos: \(jpgs)")
     }
 
     static func configParsing() async throws {

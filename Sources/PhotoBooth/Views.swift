@@ -160,6 +160,13 @@ struct BoothScreen<Preview: View>: View {
                     }
                     .transition(.opacity)
                 }
+                if case .countdown = state {
+                    // Centred on the whole screen (the camera sits above the TV's top centre), not
+                    // on the preview area, which the strip column narrows.
+                    LookHereView(h: h)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                        .transition(.opacity)
+                }
                 if case let .flyIn(photo, shot, _) = state, strip != nil {
                     // From where the review showed it to its window on the strip column.
                     let from = Self.fitRect(photo.image, in: CGRect(origin: .zero, size: area))
@@ -422,9 +429,10 @@ struct CountdownView: View {
             }
             .animation(.spring(response: 0.35, dampingFraction: 0.7), value: remaining)
             if of > 1 {
+                // At the bottom: the top centre belongs to "Look here!".
                 VStack {
-                    ShotLabel(shot: shot, of: of, h: h)
                     Spacer()
+                    ShotLabel(shot: shot, of: of, h: h, edge: .bottom)
                 }
             }
         }
@@ -435,6 +443,7 @@ struct ShotLabel: View {
     let shot: Int
     let of: Int
     let h: CGFloat
+    var edge: Edge = .top
     var body: some View {
         Text("Photo \(shot) of \(of)")
             .font(.booth(h * 0.045, .bold))
@@ -442,7 +451,27 @@ struct ShotLabel: View {
             .padding(.horizontal, h * 0.03)
             .padding(.vertical, h * 0.012)
             .background(Capsule().fill(.black.opacity(0.5)))
-            .padding(.top, h * 0.05)
+            .padding(edge == .top ? .top : .bottom, edge == .top ? h * 0.05 : h * 0.09)
+    }
+}
+
+/// During the countdown: a bouncing arrow up at the camera (above the TV's top centre), so
+/// people look into the lens rather than at themselves. Never mirrored.
+struct LookHereView: View {
+    let h: CGFloat
+    var body: some View {
+        VStack(spacing: 0) {
+            Image(systemName: "arrow.up")
+                .font(.system(size: h * 0.11, weight: .black))
+            Text("Look here!")
+                .font(.booth(h * 0.06, .black))
+        }
+        .foregroundStyle(.white)
+        .shadow(color: .black.opacity(0.7), radius: h * 0.015)
+        .phaseAnimator([0.0, 1.0]) { content, t in
+            content.offset(y: -h * 0.015 * t)
+        } animation: { _ in .easeInOut(duration: 0.6) }
+        .padding(.top, h * 0.025)
     }
 }
 
@@ -596,7 +625,7 @@ struct BannerStack: View {
 
 /// `PhotoBooth --render-strip-screen a.jpg b.jpg c.jpg --out DIR`: renders strip-mode TV frames at
 /// 1920 x 1080 with the configured artwork / caption (a still photo, mirrored, stands in for the
-/// live preview) and exits. No camera, nothing printed.
+/// live preview), plus a normal-mode countdown, and exits. No camera, nothing printed.
 @MainActor
 enum RenderStripScreen {
     static func run(photos: [String], outDir: String, configPath: String?) -> Int32 {
@@ -612,16 +641,19 @@ enum RenderStripScreen {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
 
         let two = Array(shots.prefix(2))
-        let frames: [(String, BoothState, [ReviewPhoto], CGFloat?)] = [
+        // nil photos = normal mode (no strip column).
+        let frames: [(String, BoothState, [ReviewPhoto]?, CGFloat?)] = [
             ("strip-idle", .idle, [], nil),
             ("strip-screen", .countdown(remaining: 2, shot: 3, of: 3), two, nil),
             ("strip-review", .review(shots[2], shot: 3, of: 3), two, nil),
             ("strip-flyin", .flyIn(shots[2], shot: 3, of: 3), two, 0.5),
             ("strip-final", .stripReview(shots), shots, nil),
+            ("strip-flash-notice", .notice(BoothController.missedFlashNotice), two, nil),
+            ("countdown", .countdown(remaining: 2, shot: 1, of: 1), nil, nil),
         ]
         for (name, state, filled, progress) in frames {
             var screen = BoothScreen(state: state, banners: [], idlePrompt: config.idlePrompt,
-                                     strip: StripScreen(background: background, photos: filled, message: nil)) {
+                                     strip: filled.map { StripScreen(background: background, photos: $0, message: nil) }) {
                 // Sized by its frame like the real (layer-backed) preview.
                 StripPhoto(image: shots[2].image)
                     .scaleEffect(x: config.mirrorPreview ? -1 : 1, y: 1)
