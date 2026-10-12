@@ -11,9 +11,13 @@ final class KioskWindow: NSWindow {
     override var canBecomeMain: Bool { acceptsKey }
 }
 
-/// Hosting view that shows a blank cursor over the whole window in kiosk mode.
+/// Hosting view that shows a blank cursor over the whole window in kiosk mode. Accepts first
+/// mouse, so a click on the exit pill acts even when PhotoBooth isn't the active app (rather
+/// than only activating it); nothing else in the booth view is clickable.
 final class KioskHostingView<Content: View>: NSHostingView<Content> {
     var hidesCursor = false { didSet { window?.invalidateCursorRects(for: self) } }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     static var blankCursor: NSCursor {
         NSCursor(image: NSImage(size: NSSize(width: 1, height: 1), flipped: false) { _ in true }, hotSpot: .zero)
@@ -28,7 +32,11 @@ final class KioskHostingView<Content: View>: NSHostingView<Content> {
 /// - `windowed` (--windowed): booth and control panel are ordinary windows (development).
 /// - `kiosk`: one display. The booth covers it above the menu bar, Dock and menu bar hidden,
 ///   cursor hidden. ⌘, opens the panel on top; while it's open the booth drops to normal
-///   level and the cursor shows (as on the attendant screen).
+///   level and the cursor shows (as on the attendant screen). Moving the mouse / trackpad
+///   shows the cursor and a Control Panel / Quit pill in the top-right corner for a few
+///   seconds (`revealExitPill`): a way out that works even when PhotoBooth isn't the active
+///   app, so its keyboard shortcuts (apart from the system-wide Ctrl+Opt+Cmd+Q / R) go
+///   elsewhere.
 /// - `twoScreen`: the booth covers the TV at kiosk level but never takes key focus; the
 ///   panel is a normal window on the other display (normally the laptop's). Dock and menu bar
 ///   stay; the cursor hides only while it's over the TV.
@@ -63,6 +71,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var printWindow: NSWindow?
     private var printScreenID: UInt32?
     private var pointerMonitors: [Any] = []
+    /// Single-screen kiosk: the pointer-revealed Control Panel / Quit pill.
+    private let exitPill = KioskExitModel()
+    private var exitPillTimer: Timer?
+    private static let exitPillSeconds: TimeInterval = 5
 
     private enum Presentation { case windowed, kiosk, twoScreen }
     private var presentation: Presentation {
@@ -149,6 +161,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         sleepAssertion?.release()
         for m in pointerMonitors { NSEvent.removeMonitor(m) }
         pointerMonitors = []
+        exitPillTimer?.invalidate()
+        exitPillTimer = nil
         setCursorHidden(false)
         FileLog.shared.flush()
     }
@@ -174,6 +188,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         preview.attach(camera.liveViewFrames())
         self.preview = preview
 
+        exitPill.onControlPanel = { [weak self] in
+            BoothLog.info(.app, "Control panel from on-screen button")
+            self?.showPanel()
+        }
+        exitPill.onQuit = {
+            BoothLog.info(.app, "Quit from on-screen button")
+            NSApp.terminate(nil)
+        }
         let host = KioskHostingView(rootView: boothView(controller, preview))
         host.hidesCursor = kiosk
         boothHost = host
@@ -243,7 +265,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func boothView(_ controller: BoothController, _ preview: LivePreviewNSView) -> BoothRootView {
         BoothRootView(controller: controller, preview: preview, idlePrompt: config.idlePrompt,
-                      stripMode: config.stripMode, stripBackground: stripBackground)
+                      stripMode: config.stripMode, stripBackground: stripBackground, exitPill: exitPill)
     }
 
     /// Strip mode: renders the strip column's artwork / caption (as printed) off the main thread.
@@ -729,12 +751,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     /// Re-assert the presentation for the current mode (after activation / screen changes).
     private func enforceKiosk() {
+        // The exit pill only belongs on a single-screen kiosk with no attendant window open.
+        if exitPill.visible, presentation != .kiosk || attendantWindowVisible { dropExitPill() }
         guard kiosk else { return }
         switch presentation {
         case .kiosk:
             NSApp.presentationOptions = [.hideDock, .hideMenuBar]
-            boothHost?.hidesCursor = !attendantWindowVisible
-            if attendantWindowVisible {
+            let showCursor = attendantWindowVisible || exitPill.visible
+            boothHost?.hidesCursor = !showCursor
+            if showCursor {
                 setCursorHidden(false)
             } else {
                 // Unhide + hide: macOS can show the cursor again after activation.
@@ -766,17 +791,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         setCursorHidden(NSMouseInRect(NSEvent.mouseLocation, frame, false))
     }
 
+    /// Single-screen kiosk, no attendant window open: the pointer moved, so show the cursor and
+    /// the Control Panel / Quit pill until `exitPillSeconds` after the last movement. The
+    /// cursor goes through `enforceKiosk` / `setCursorHidden`, so hiding again restores the
+    /// kiosk state with balanced NSCursor hide/unhide calls.
+    private func revealExitPill() {
+        guard presentation == .kiosk, !attendantWindowVisible, boothHost != nil else { return }
+        exitPillTimer?.invalidate()
+        exitPillTimer = Timer.scheduledTimer(withTimeInterval: Self.exitPillSeconds, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated { self?.hideExitPill() }
+        }
+        guard !exitPill.visible else { return }
+        exitPill.visible = true
+        enforceKiosk()  // shows the cursor and drops the blank cursor rect
+        NSCursor.arrow.set()
+    }
+
+    /// Timer: hide the pill and re-assert the kiosk cursor.
+    private func hideExitPill() {
+        guard exitPill.visible else { dropExitPill(); return }
+        dropExitPill()
+        enforceKiosk()
+    }
+
+    /// Hide the pill without touching the cursor (the caller re-asserts the presentation).
+    private func dropExitPill() {
+        exitPillTimer?.invalidate()
+        exitPillTimer = nil
+        exitPill.visible = false
+    }
+
+    private func pointerMoved() {
+        updatePointerCursor()
+        revealExitPill()
+    }
+
     /// Mouse-moved monitors: global (pointer over other apps' windows) and local (ours).
     private func installPointerMonitors() {
         guard pointerMonitors.isEmpty else { return }
         let mask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
         if let g = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] _ in
-            MainActor.assumeIsolated { self?.updatePointerCursor() }
+            MainActor.assumeIsolated { self?.pointerMoved() }
         }) {
             pointerMonitors.append(g)
         }
         if let l = NSEvent.addLocalMonitorForEvents(matching: mask, handler: { [weak self] event in
-            MainActor.assumeIsolated { self?.updatePointerCursor() }
+            MainActor.assumeIsolated { self?.pointerMoved() }
             return event
         }) {
             pointerMonitors.append(l)

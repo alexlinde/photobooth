@@ -1,6 +1,7 @@
 import BoothCore
 import AppKit
 import IOKit.hid
+import Carbon.HIToolbox
 
 /// Guest button input plus attendant shortcuts.
 ///
@@ -14,10 +15,16 @@ import IOKit.hid
 ///   reaches the focused app (see `openHID`). The local path ignores the button key while in
 ///   `hid` mode, so it can't double-trigger.
 ///
-/// A local monitor is always installed for the attendant shortcuts (Ctrl+Opt+Cmd+Q quit,
-/// Ctrl+Opt+Cmd+R reset/reload, Ctrl+Opt+Cmd+D fake-camera disconnect) and to swallow plain
-/// key presses so the kiosk window doesn't beep. Keys aimed at other windows (the control
-/// panel; see `isBoothEvent`) pass through.
+/// Attendant shortcuts: Ctrl+Opt+Cmd+Q quit and Ctrl+Opt+Cmd+R reset/reload are registered as
+/// system-wide hot keys (`GlobalHotKeys`), so they work even when PhotoBooth isn't the active
+/// app (say the booth window covers the only screen but another app has the keyboard). The
+/// system consumes a registered hot key before any app sees it; the local monitor handles a
+/// shortcut only when its registration failed. Ctrl+Opt+Cmd+D (fake-camera disconnect) is
+/// local only.
+///
+/// A local monitor is always installed for the attendant shortcuts not registered globally and
+/// to swallow plain key presses so the kiosk window doesn't beep. Keys aimed at other windows
+/// (the control panel; see `isBoothEvent`) pass through.
 @MainActor
 final class ButtonInput {
     struct DeviceInfo: Equatable, CustomStringConvertible {
@@ -84,6 +91,9 @@ final class ButtonInput {
     private var seizeFailure: String?
     private var localMonitor: Any?
     private var permissionTimer: Timer?
+    private let hotKeys = GlobalHotKeys()
+    /// Shortcuts registered system-wide; the local monitor leaves these alone (no double fire).
+    private var globalShortcuts: Set<Shortcut> = []
 
     init(key: KeySpec?, mode: BoothConfig.ButtonInput, deviceFilter: BoothConfig.DeviceFilter?, learn: Bool = false) {
         self.key = key
@@ -95,6 +105,7 @@ final class ButtonInput {
 
     func start() {
         installLocalMonitor()
+        installGlobalHotKeys()
         if requestedMode == .hid || learn {
             startHIDOrFallBack()
         } else {
@@ -109,6 +120,8 @@ final class ButtonInput {
     func stop() {
         if let m = localMonitor { NSEvent.removeMonitor(m) }
         localMonitor = nil
+        hotKeys.unregisterAll()
+        globalShortcuts = []
         stopHID()
         permissionTimer?.invalidate()
         permissionTimer = nil
@@ -279,6 +292,28 @@ final class ButtonInput {
         onPress?()
     }
 
+    // MARK: Global hot keys
+
+    private static let globalKeys: [(Shortcut, GlobalHotKeys.Key, String)] = [
+        (.quit, .init(keyCode: UInt32(kVK_ANSI_Q), modifiers: GlobalHotKeys.attendantModifiers), "Ctrl+Opt+Cmd+Q"),
+        (.attendantReset, .init(keyCode: UInt32(kVK_ANSI_R), modifiers: GlobalHotKeys.attendantModifiers), "Ctrl+Opt+Cmd+R"),
+    ]
+
+    private func installGlobalHotKeys() {
+        hotKeys.onPress = { [weak self] key in
+            guard let s = Self.globalKeys.first(where: { $0.1 == key })?.0 else { return }
+            // Reset from another app: bring the booth forward so the attendant sees the result.
+            if s == .attendantReset, !NSApp.isActive { NSApp.activate(ignoringOtherApps: true) }
+            self?.onShortcut?(s)
+        }
+        for (s, key, name) in Self.globalKeys where !globalShortcuts.contains(s) {
+            if hotKeys.register(key, name: name) { globalShortcuts.insert(s) }
+        }
+        if !globalShortcuts.isEmpty {
+            BoothLog.info(.input, "System-wide attendant hot keys: \(Self.globalKeys.filter { globalShortcuts.contains($0.0) }.map(\.2).joined(separator: ", "))")
+        }
+    }
+
     // MARK: Local monitor
 
     private func installLocalMonitor() {
@@ -294,11 +329,16 @@ final class ButtonInput {
     private func handleLocal(_ event: NSEvent) -> NSEvent? {
         let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         if mods.isSuperset(of: [.control, .option, .command]) {
-            switch event.keyCode {
-            case 12: onShortcut?(.quit); return nil                // Q
-            case 15: onShortcut?(.attendantReset); return nil      // R
-            case 2: onShortcut?(.simulateDisconnect); return nil   // D
-            default: break
+            let shortcut: Shortcut? = switch event.keyCode {
+            case 12: .quit                // Q
+            case 15: .attendantReset      // R
+            case 2: .simulateDisconnect   // D
+            default: nil
+            }
+            if let shortcut {
+                // A registered hot key never reaches us; if one somehow did, it already fired.
+                if !globalShortcuts.contains(shortcut) { onShortcut?(shortcut) }
+                return nil
             }
         }
         // Let Cmd-key equivalents (Cmd+Q, Cmd+,) through to the menu.

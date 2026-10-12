@@ -74,12 +74,25 @@ struct BoothRootView: View {
     var stripMode = false
     /// Strip mode: one strip as printed (artwork or caption), drawn under the slots.
     var stripBackground: CGImage?
+    /// Single-screen kiosk: the attendant's Control Panel / Quit pill (top right).
+    var exitPill: KioskExitModel?
 
     var body: some View {
         BoothScreen(state: controller.state, banners: banners, idlePrompt: idlePrompt,
                     strip: stripMode ? StripScreen(background: stripBackground, photos: controller.stripPhotos,
                                                    message: controller.stripMessage) : nil) {
             LivePreview(view: preview)
+        }
+        .overlay(alignment: .topTrailing) {
+            let shown = exitPill?.visible == true
+            ZStack {
+                if shown, let exitPill {
+                    KioskExitPill(model: exitPill)
+                        .padding(16)
+                        .transition(.opacity)
+                }
+            }
+            .animation(.easeInOut(duration: 0.2), value: shown)
         }
     }
 
@@ -91,6 +104,46 @@ struct BoothRootView: View {
         case .review, .stripReview: return []
         default: return b
         }
+    }
+}
+
+/// Single-screen kiosk: shown by `AppDelegate` while the pointer moves (it hides a few seconds
+/// after the last movement), so the attendant can always get out with the trackpad, even when
+/// PhotoBooth isn't the active app and its keyboard shortcuts go elsewhere.
+@MainActor
+@Observable
+final class KioskExitModel {
+    var visible = false
+    var onControlPanel: () -> Void = {}
+    var onQuit: () -> Void = {}
+}
+
+/// Small top-right pill: "Control Panel" and "Quit PhotoBooth". No confirmation: guests never
+/// touch the trackpad. The hosting view accepts first mouse, so a click acts even when
+/// PhotoBooth isn't the active app.
+struct KioskExitPill: View {
+    let model: KioskExitModel
+    var body: some View {
+        HStack(spacing: 6) {
+            button("Control Panel", systemImage: "slider.horizontal.3", action: model.onControlPanel)
+            button("Quit PhotoBooth", systemImage: "power", action: model.onQuit)
+        }
+        .padding(5)
+        .background(Capsule().fill(Color.black.opacity(0.7)))
+        .overlay(Capsule().strokeBorder(Color.white.opacity(0.25)))
+    }
+
+    private func button(_ title: String, systemImage: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: systemImage)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(Capsule().fill(Color.white.opacity(0.16)))
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
     }
 }
 

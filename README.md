@@ -406,7 +406,11 @@ don't leave a text field focused. See `docs/stealthswitch3-protocol.md` for prog
 
 Attendant keys: **Ctrl+Opt+Cmd+Q** quit, **Ctrl+Opt+Cmd+R** retry / reload config, **⌘,** control panel,
 **⌘P** print window.
+Ctrl+Opt+Cmd+Q and R are system-wide: they work even when PhotoBooth isn't the frontmost app
+(say the TV was unplugged and the booth now covers the laptop screen while another app has the keyboard).
 Cmd+Q also quits.
+On a single screen, moving the mouse / trackpad shows the cursor and **Control Panel** / **Quit PhotoBooth**
+buttons in the top-right corner for a few seconds; they work with one click even when PhotoBooth isn't frontmost.
 Esc does nothing. (Ctrl+Opt+Cmd+D simulates a camera disconnect, fake camera only.)
 
 Logs: `~/PhotoBooth/logs/booth-YYYYMMDD.log`, and live with

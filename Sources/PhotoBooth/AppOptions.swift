@@ -39,6 +39,7 @@ struct AppOptions {
       --snapshot-dir DIR      Dev: save a PNG of the window after each state change
     Attendant keys: Ctrl+Opt+Cmd+Q quit, Ctrl+Opt+Cmd+R retry / reload config,
                     Ctrl+Opt+Cmd+D simulate camera disconnect (fake camera only). Cmd+Q also quits.
+                    Q and R work system-wide, even when PhotoBooth isn't the frontmost app.
     """
 
     static func parse(_ args: [String]) throws -> AppOptions {
